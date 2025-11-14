@@ -5,12 +5,12 @@ import torch
 torch.set_grad_enabled(True)
 
 from kineticsGPU.reactionParser import parseReactions, build_reactions
-from kineticsGPU.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch
+from kineticsGPU.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch, ReactionSystem
 from validationReactions import ElementaryReactionVal, ThreeBodyReactionVal, FalloffReactionVal
 
 yaml_file = "gri30.yaml"
 dtype = torch.float64
-device = 'cpu'
+device = 'cuda'
 y = yaml_thermo.yamlParser(yaml_file)
 vec_th = y.populateVectorizedThermoObject(dtype=dtype, device=device)
 reactions = parseReactions(yaml_file)
@@ -51,16 +51,18 @@ for r in reactions:
         ))
 
 r_e, r_tb, r_f, system = build_reactions(vec_th.species, reactions, vec_th, device, dtype)
+
 batched_elem = ElementaryReactionBatch(r_e, device=device, dtype=dtype)
 batched_tb = ThreeBodyReactionBatch(r_tb, device=device, dtype=dtype)
 batched_f = FalloffReactionBatch(r_f, device=device, dtype=dtype)
+reaction_system = ReactionSystem([batched_elem, batched_tb, batched_f])
+
 
 TC = np.random.random((1000, len(vec_th.species) + 1))
 TC[:, 0] = 2000.0
 
 C = torch.tensor(TC[:, 1:], device=device, dtype=dtype)
 T = torch.tensor(TC[:, 0], device=device, dtype=dtype)
-import math
 """
 for n in range(len(r_e)):
     vec_RR = r_e[n].RR(T, C)
@@ -88,21 +90,25 @@ for n in range(len(r_f)):
 """
 
 import time
-dCdt = torch.zeros((T.shape[0], len(r_f)), device=device, dtype=dtype)
+list = r_e
+
+dCdt = torch.zeros((T.shape[0], len(list)), device=device, dtype=dtype)
 t0 = time.perf_counter()
-for i, r in enumerate(r_f):
-    RR = r.RR(T, C)
+for i, r in enumerate(list):
+    dCdt[:, i] = r.RR(T, C)
+    """
     for spe, coef in zip(r.reactants_idx, r.reactants_sto):
         dCdt[:, spe] -= coef * RR
     for spe, coef in zip(r.products_idx, r.products_sto):
         dCdt[:, spe] += coef * RR
+    """
 print(time.perf_counter() - t0)
 t0 = time.perf_counter()
-omega = batched_f.omega_from_RR(batched_f.RR_scatter(T, C))
+omega = batched_elem.RR(T, C)
 print(time.perf_counter() - t0)
 
 print(omega,'\n', dCdt)
-1/0
+
 """
 t0 = time.perf_counter()
 for tc in TC:
@@ -115,7 +121,6 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 import cantera as ct
 import time
-from kineticsGPU.torchdiffeq import odeint
 
 # ==============================================================
 # Hypothèses :
@@ -197,32 +202,25 @@ def rhs_adiabatic(TC, t):
     C = TC[:, 1:]
 
     # cinétique chimique (ton modèle)
-    dCdt = torch.zeros_like(C)
-    for reac in r_e+r_tb+r_f:
-        RR = reac.RR(T, C)  # mol/m3/s
-        #TODO: find a way to vectorize, maybe with torch._scatter_add ?
-        for spe, coef in zip(reac.reactants_idx, reac.reactants_sto):
-            dCdt[:, spe] -= coef * RR
-        for spe, coef in zip(reac.products_idx, reac.products_sto):
-            dCdt[:, spe] += coef * RR
+    dCdt = reaction_system.omega_total(T, C)
 
-        # total molar concentration (mol/m3)
-        n_tot = torch.sum(C, dim=1)  # (N,)
-        # mole fractions X = C / n_tot
-        X = C / n_tot[:, None]  # (N, nspecies)
-        # mixture molar Cv (J/mol/K)
-        cv_mol_mix = vec_th.cv_mix_mol(T, X)  # (N,)
-        # dH_molar/dt = Σ_i h_i(T) * dC_i/dt  (J/m3/s)
-        dHdt_molar = vec_th.h_mix_mol(T, dCdt)  # (N,)
-        # d(n_tot)/dt = Σ_i dC_i/dt
-        #dn_dt = torch.sum(dCdt, dim=1)  # (N,)
+    # total molar concentration (mol/m3)
+    n_tot = torch.sum(C, dim=1)  # (N,)
+    # mole fractions X = C / n_tot
+    X = C / n_tot[:, None]  # (N, nspecies)
+    # mixture molar Cv (J/mol/K)
+    cv_mol_mix = vec_th.cv_mix_mol(T, X)  # (N,)
+    # dH_molar/dt = Σ_i h_i(T) * dC_i/dt  (J/m3/s)
+    dHdt_molar = vec_th.h_mix_mol(T, dCdt)  # (N,)
+    # d(n_tot)/dt = Σ_i dC_i/dt
+    #dn_dt = torch.sum(dCdt, dim=1)  # (N,)
 
-        # final dT/dt (K/s) — full expression including R*T*dn/dt term
-        #dTdt = - (dHdt_molar - R * T * dn_dt) / (n_tot * cv_mol_mix)
-        dTdt = - (dHdt_molar) / (n_tot * cv_mol_mix)
+    # final dT/dt (K/s) — full expression including R*T*dn/dt term
+    #dTdt = - (dHdt_molar - R * T * dn_dt) / (n_tot * cv_mol_mix)
+    dTdt = - (dHdt_molar) / (n_tot * cv_mol_mix)
 
-        # assemble result
-        dTCdt = torch.cat((dTdt[:, None], dCdt), dim=1)
+    # assemble result
+    dTCdt = torch.cat((dTdt[:, None], dCdt), dim=1)
 
     return dTCdt
 
@@ -238,9 +236,11 @@ Y0 = torch.cat((T0_t, C0_t), dim=1)                     # shape (batch_size, sta
 integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
 t0 = time.perf_counter()
 
-for _ in t_eval_torch:
+for i, t in enumerate(t_eval_torch):
     print(Y0)
-    Y0 = integrator.step(Y0, _, dt, method='gmres', precond='identity')
+    Y0 = integrator.step(Y0, t, dt, method='dense', precond='identity')
+    if i%10 == 0 and device=='cuda':
+        torch.cuda.empty_cache()
 
 #sol_torch = odeint(rhs_adiabatic, Y0, t_eval_torch, method='trbdf2')  # shape (n_points, state)
 print(time.perf_counter() - t0)

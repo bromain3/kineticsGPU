@@ -92,9 +92,10 @@ class ElementaryReactionBatch:
     Handles different-sized reactants/products without Python loops.
     """
 
-    def __init__(self, reactions, device, dtype):
+    def __init__(self, reactions, device, dtype, eps=1e-300):
         self.device = device
         self.dtype = dtype
+        self.eps = eps
 
         self.n_reactions = len(reactions)
         self.thermo = reactions[0].thermo
@@ -142,7 +143,7 @@ class ElementaryReactionBatch:
             dtype=dtype, device=device
         )
 
-        self.generate_padded_indices(reactions, device, dtype)
+        #self.generate_padded_indices(reactions, device, dtype)
 
     def generate_padded_indices(self, reactions, device, dtype):
         n_reactions = len(reactions)
@@ -165,12 +166,12 @@ class ElementaryReactionBatch:
         for i, r in enumerate(reactions):
             nr, np = len(r.reactants_idx), len(r.products_idx)
 
-            react_idx_padded[i, :nr] = torch.tensor(r.reactants_idx, dtype=torch.long, device=device)
-            react_sto_padded[i, :nr] = torch.tensor(r.reactants_sto, dtype=dtype, device=device)
+            react_idx_padded[i, :nr] = torch.tensor(r.reactants_idx, dtype=torch.long, device=device)  #TODO: use r.reactants_idx.clone().detach()
+            react_sto_padded[i, :nr] = torch.tensor(r.reactants_sto, dtype=dtype, device=device)       #TODO: same
             react_mask[i, :nr] = 1.0
 
-            prod_idx_padded[i, :np] = torch.tensor(r.products_idx, dtype=torch.long, device=device)
-            prod_sto_padded[i, :np] = torch.tensor(r.products_sto, dtype=dtype, device=device)
+            prod_idx_padded[i, :np] = torch.tensor(r.products_idx, dtype=torch.long, device=device)#TODO: same
+            prod_sto_padded[i, :np] = torch.tensor(r.products_sto, dtype=dtype, device=device)#TODO: same
             prod_mask[i, :np] = 1.0
         self.react_idx_padded = react_idx_padded
         self.prod_idx_padded = prod_idx_padded
@@ -263,13 +264,15 @@ class ElementaryReactionBatch:
 
         return kf * (conc_r - (1.0 - self.oneWay[None, :]) * conc_p / Kc)
 
-    def RR_scatter(self, T, C):
+    ## previously RR_scatter(T, C)
+    def RR(self, T, C):
         ncells = T.shape[0]
         kf = self.kf(T)
         Kc = self.Kc(T)
 
-        logC_r = torch.log(C[:, self.react_idx])  # (ncells, n_total_react)
-        logC_p = torch.log(C[:, self.prod_idx])
+        C_safe = torch.clamp(C, min=self.eps)
+        logC_r = torch.log(C_safe[:, self.react_idx])  # (ncells, n_total_react)
+        logC_p = torch.log(C_safe[:, self.prod_idx])
 
         conc_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         conc_p = torch.zeros_like(conc_r)
@@ -286,6 +289,50 @@ class ElementaryReactionBatch:
         conc_p = torch.exp(conc_p)
 
         return kf * (conc_r - (1.0 - self.oneWay[None, :]) * conc_p / Kc)
+
+
+    # ------------------------------------------------------------
+    # Compute species production rates omega from RR
+    # RR : (ncells, n_reactions)
+    # Returns w : (ncells, n_species)
+    # ------------------------------------------------------------
+    def omega_from_RR(self, RR):
+        ncells = RR.shape[0]
+        n_species = len(self.species)
+
+        w = torch.zeros((ncells, n_species), device=self.device, dtype=self.dtype)
+
+        # ---------- Reactants: consumption ----------
+        # flattened reactant species indices (size = n_total_react)
+        idx_r = self.react_idx              # species indices
+        sto_r = self.react_sto              # stoichiometric coefficients
+
+        # map each flattened react entry to its reaction index
+        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_r))
+
+        # expand RR to match flattened react list
+        RR_exp_r = RR[:, idx_r_scatter]     # (ncells, n_total_react)
+
+        # contribution: -nu_r * RR
+        contrib_r = -sto_r[None, :] * RR_exp_r
+
+        # scatter add on species axis
+        w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r)
+
+        # ---------- Products: production ----------
+        idx_p = self.prod_idx
+        sto_p = self.prod_sto
+
+        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_p))
+
+        RR_exp_p = RR[:, idx_p_scatter]
+        contrib_p = sto_p[None, :] * RR_exp_p
+
+        w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
+
+        return w
 
 
 class ThreeBodyReaction(ElementaryReaction):
@@ -351,9 +398,10 @@ class ThreeBodyReactionBatch:
     and accounts for [M] concentration from species efficiencies.
     """
 
-    def __init__(self, reactions, device, dtype):
+    def __init__(self, reactions, device, dtype, eps=1e-300):
         self.device = device
         self.dtype = dtype
+        self.eps = eps
 
         self.n_reactions = len(reactions)
         self.thermo = reactions[0].thermo
@@ -442,13 +490,14 @@ class ThreeBodyReactionBatch:
 
     # ----- Reaction rates -----
     # ----- RR scatter (full GPU vectorized, log + scatter_add) -----
-    def RR_scatter(self, T, C):
+    def RR(self, T, C):
         ncells = T.shape[0]
         kf = self.kf(T)
         Kc = self.Kc(T)
 
-        logC_r = torch.log(C[:, self.react_idx])
-        logC_p = torch.log(C[:, self.prod_idx])
+        C_safe = torch.clamp(C, min=self.eps)
+        logC_r = torch.log(C_safe[:, self.react_idx])
+        logC_p = torch.log(C_safe[:, self.prod_idx])
 
         conc_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         conc_p = torch.zeros_like(conc_r)
@@ -467,6 +516,48 @@ class ThreeBodyReactionBatch:
         return baseRR * M
 
 
+    # ------------------------------------------------------------
+    # Compute species production rates omega from RR
+    # RR : (ncells, n_reactions)
+    # Returns w : (ncells, n_species)
+    # ------------------------------------------------------------
+    def omega_from_RR(self, RR):
+        ncells = RR.shape[0]
+        n_species = len(self.species)
+
+        w = torch.zeros((ncells, n_species), device=self.device, dtype=self.dtype)
+
+        # ---------- Reactants: consumption ----------
+        # flattened reactant species indices (size = n_total_react)
+        idx_r = self.react_idx              # species indices
+        sto_r = self.react_sto              # stoichiometric coefficients
+
+        # map each flattened react entry to its reaction index
+        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_r))
+
+        # expand RR to match flattened react list
+        RR_exp_r = RR[:, idx_r_scatter]     # (ncells, n_total_react)
+
+        # contribution: -nu_r * RR
+        contrib_r = -sto_r[None, :] * RR_exp_r
+
+        # scatter add on species axis
+        w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r)
+
+        # ---------- Products: production ----------
+        idx_p = self.prod_idx
+        sto_p = self.prod_sto
+
+        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_p))
+
+        RR_exp_p = RR[:, idx_p_scatter]
+        contrib_p = sto_p[None, :] * RR_exp_p
+
+        w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
+
+        return w
 
 
 
@@ -944,7 +1035,7 @@ class FalloffReactionBatch:
         return Kc
 
     # ----- Reaction rates (scatter style) -----
-    def RR_scatter(self, T, C):
+    def RR(self, T, C):
         """
         Compute RR for all reactions and cells, returns (ncells, n_reactions)
         Implementation mirrors ThreeBodyReactionBatch.RR_scatter but uses kf(T,C)
@@ -974,6 +1065,8 @@ class FalloffReactionBatch:
 
         baseRR = kf * (conc_r - (1.0 - self.oneWay[None, :]) * conc_p / Kc)
         return baseRR
+
+
 
     # ----- Convenience: compute species production rates (omega) -----
     def omega_from_RR(self, RR):
@@ -1007,3 +1100,44 @@ class FalloffReactionBatch:
         w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
 
         return w
+
+
+
+class ReactionSystem:
+    def __init__(self, reactionsBatches):
+        self.reactionsBatches = reactionsBatches
+        self.device = reactionsBatches[0].device
+        self.dtype = reactionsBatches[0].dtype
+
+        self.n_species = len(reactionsBatches[0].species)
+
+
+    def omega_total(self, T, C):
+        """
+        Compute total species production rates omega.
+        Returns tensor of shape (ncells, n_species)
+        """
+        ncells = T.shape[0]
+        w_total = torch.zeros((ncells, self.n_species), device=self.device, dtype=self.dtype)
+
+        for b in self.reactionsBatches:
+            RR = b.RR(T, C)       # (ncells, n_reactions_in_batch)
+            w = b.omega_from_RR(RR)       # (ncells, n_species)
+            w_total += w                  # sum over batches
+
+        return w_total
+
+    def omega_total_no_log(self, T, C):
+        """
+        Compute total species production rates omega.
+        Returns tensor of shape (ncells, n_species)
+        """
+        ncells = T.shape[0]
+        w_total = torch.zeros((ncells, self.n_species), device=self.device, dtype=self.dtype)
+
+        for b in self.reactionsBatches:
+            RR = b.RR_no_log(T, C)       # (ncells, n_reactions_in_batch)
+            w = b.omega_from_RR(RR)       # (ncells, n_species)
+            w_total += w                  # sum over batches
+
+        return w_total
