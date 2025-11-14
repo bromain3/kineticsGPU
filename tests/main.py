@@ -232,15 +232,14 @@ t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
-Y0 = torch.cat((T0_t, C0_t), dim=1)                     # shape (batch_size, state) => odeint will accept
+Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1000, 1)                     # shape (batch_size, state) => odeint will accept
 integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
 t0 = time.perf_counter()
 
 for i, t in enumerate(t_eval_torch):
     print(Y0)
-    Y0 = integrator.step(Y0, t, dt, method='dense', precond='identity')
-    if i%10 == 0 and device=='cuda':
-        torch.cuda.empty_cache()
+    Y0 = integrator.step(Y0, t, dt, method='gmres', precond='identity') #TODO: investigate GPU memory increasing during integration
+
 
 #sol_torch = odeint(rhs_adiabatic, Y0, t_eval_torch, method='trbdf2')  # shape (n_points, state)
 print(time.perf_counter() - t0)

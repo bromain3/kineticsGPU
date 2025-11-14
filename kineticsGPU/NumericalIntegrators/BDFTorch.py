@@ -22,6 +22,7 @@ import torch
 Tensor = torch.Tensor
 
 
+# TODO: investigate GPU memory increasing during integration
 def _ensure_batch_dim(x: Tensor) -> Tensor:
     if x.dim() == 1:
         return x.unsqueeze(0)
@@ -75,7 +76,7 @@ class BackwardEulerIntegrator:
         t_new = t + h
 
         # initial guess: explicit Euler or previous state
-        xk = x_b + h * self.f(x_b, t)
+        xk = x_b + h * self.f(x_b, t) #TODO: maybe do both, and start form the one with the best converged newton ?
 
         # choose preconditioner
         if precond == 'identity':
