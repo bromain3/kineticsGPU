@@ -227,6 +227,7 @@ def rhs_adiabatic(TC, t):
 
 # === INTÉGRATION ===
 from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
+from kineticsGPU.NumericalIntegrators.RKF45 import AdaptiveExplicitRKF45
 dt = 1e-6
 t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
@@ -234,17 +235,24 @@ T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape 
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
 Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1000, 1)                     # shape (batch_size, state) => odeint will accept
 integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
+integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
 t0 = time.perf_counter()
 
 for i, t in enumerate(t_eval_torch):
     print(Y0)
     Y0 = integrator.step(Y0, t, dt, method='gmres', precond='identity') #TODO: investigate GPU memory increasing during integration
 
+#t = 0.0
+#h = dt
+#while t < t_eval_torch[-1].item():
+#    Y0, h = integratorrkf45.step_adaptive(Y0, t, dt, atol=1e-8, rtol=1e-8, safety=0.9, controller='PI', verbose=False)
+#    t+=h
+#    print(t)
 
 #sol_torch = odeint(rhs_adiabatic, Y0, t_eval_torch, method='trbdf2')  # shape (n_points, state)
 print(time.perf_counter() - t0)
 # convert solution to numpy for comparisons & plotting
-sol_torch_cpu = sol_torch.detach().cpu().numpy()   # shape (n_points, nbatches, 1 + n_species)
+sol_torch_cpu = Y0.detach().cpu().numpy()   # shape (n_points, nbatches, 1 + n_species)
 T_torch = sol_torch_cpu[:, 0, 0].flatten()
 C_torch = sol_torch_cpu[:, 0, 1:]  # mol/m3
 X_torch = C_torch / np.sum(C_torch, axis=1, keepdims=True)

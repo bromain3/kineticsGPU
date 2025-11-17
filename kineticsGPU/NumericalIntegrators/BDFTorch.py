@@ -97,10 +97,13 @@ class BackwardEulerIntegrator:
 
         # Newton iterations
         for nit in range(self.newton_maxiter):
-            xk = xk.requires_grad_(True)
-            fxk = self.f(xk, t_new)
+            # compute residual WITHOUT keeping a history linked aux solves
+            xk = xk.detach()  # detach before computing residual
+            fxk = self.f(xk, t_new)  # no grad history needed for residual
             # Residual F = xk - x - h * f(xk, t+h)
             F = xk - x_b - h * fxk  # shape (B, N)
+            # if we need a grad-enabled version for Jacobian-vector products inside solvers,
+            # we'll create a fresh detached.requires_grad_(True) inside those solvers.
             res_norm = F.detach().norm(dim=1).max().item()
             if self.verbose:
                 print(f"Newton iter {nit}, max residual norm = {res_norm:.3e}")
@@ -171,22 +174,24 @@ class BackwardEulerIntegrator:
         """
         B, N = rhs.shape
         # matvec: apply A @ v = (I - h J) v, computed with Jv via jvp on f
+        x_for_jvp_base = x.detach()
         def matvec(v: Tensor) -> Tensor:
+            v_ = v.detach()
             # v: (B, N)
             # compute jvp of f at x: jvp = J_f @ v
-            _, jvp = torch.autograd.functional.jvp(lambda z: self.f(z, t), x, v, create_graph=False)
-            return v - h * jvp
+            x_local = x_for_jvp_base.requires_grad_(True)
+            _, jvp = torch.autograd.functional.jvp(lambda z: self.f(z, t), x_local, v_, create_graph=False)
+            return v_ - h * jvp
 
         # initialize solution
-        dx = torch.zeros_like(rhs)
-        r = rhs - matvec(dx)  # initial residual = rhs
+        x_sol = torch.zeros_like(rhs)
+        r = rhs.detach() - matvec(x_sol)  # initial residual = rhs
         # apply preconditioner
-        z = m_inv_fn(r)
+        z = m_inv_fn(r).detach()
         beta = torch.norm(z, dim=1)
         # handle zero betas
         beta = torch.where(beta == 0, torch.tensor(1.0, device=self.device, dtype=self.dtype), beta)
 
-        x_sol = dx.clone()
         max_restarts = math.ceil(self.gmres_maxiter / self.gmres_restart)
 
         for restart in range(max_restarts):
@@ -194,21 +199,21 @@ class BackwardEulerIntegrator:
             m = min(self.gmres_restart, self.gmres_maxiter - restart * self.gmres_restart)
             V = torch.zeros((B, m + 1, N), device=self.device, dtype=self.dtype)
             H = torch.zeros((B, m + 1, m), device=self.device, dtype=self.dtype)
+            g = torch.zeros((B, m + 1), device=self.device, dtype=self.dtype)
 
             # initial v0 = z / beta
-            v0 = z / beta.unsqueeze(1)
+            v0 = (z / beta.unsqueeze(1)).detach()
             V[:, 0, :] = v0
-            g = torch.zeros((B, m + 1), device=self.device, dtype=self.dtype)
             g[:, 0] = beta
 
             for j in range(m):
-                vj = V[:, j, :]
-                w = matvec(vj)
+                vj = V[:, j, :].detach()
+                w = matvec(vj).detach()
                 # apply preconditioner
-                w = m_inv_fn(w)
+                w = m_inv_fn(w).detach()
                 # Modified Gram-Schmidt
                 for i in range(j + 1):
-                    vi = V[:, i, :]
+                    vi = V[:, i, :].detach()
                     hij = torch.sum(w * vi, dim=1)
                     H[:, i, j] = hij
                     w = w - hij.unsqueeze(1) * vi
@@ -230,8 +235,8 @@ class BackwardEulerIntegrator:
             # Use torch.linalg.lstsq per batch inside a loop (m is small)
             y = torch.zeros((B, m), device=self.device, dtype=self.dtype)
             for b in range(B):
-                Hb = H[b, :m + 1, :m]
-                gb = g[b, :m + 1]
+                Hb = H[b, :m + 1, :m].detach()
+                gb = g[b, :m + 1].detach()
                 # least squares solve Hb @ y = gb
                 # use torch.linalg.lstsq if available
                 sol = torch.linalg.lstsq(Hb, gb.unsqueeze(1)).solution.squeeze(1)
@@ -240,13 +245,13 @@ class BackwardEulerIntegrator:
             # update solution
             # dx += V[:, :m, :].transpose(1,2) @ y
             # compute batch matmul: (B, N, m) @ (B, m) -> (B, N)
-            V_nm = V[:, :m, :].permute(0, 2, 1)  # (B, N, m)
+            V_nm = V[:, :m, :].permute(0, 2, 1).detach()  # (B, N, m)
             y_unsq = y.unsqueeze(-1)  # (B, m, 1)
-            delta = torch.matmul(V_nm, y_unsq).squeeze(-1)
-            x_sol = x_sol + delta
+            delta = torch.matmul(V_nm, y_unsq).squeeze(-1).detach()
+            x_sol = (x_sol + delta).detach()
 
             # compute new residual
-            r = rhs - matvec(x_sol)
+            r = (rhs.detach() - matvec(x_sol)).detach()
             res_norms = torch.norm(r, dim=1)
             if self.verbose:
                 print(f"GMRES restart {restart}, max residual = {res_norms.max().item():.3e}")
@@ -254,7 +259,7 @@ class BackwardEulerIntegrator:
                 break
 
             # prepare next restart
-            z = m_inv_fn(r)
+            z = m_inv_fn(r).detach()
             beta = torch.norm(z, dim=1)
             beta = torch.where(beta == 0, torch.tensor(1.0, device=self.device, dtype=self.dtype), beta)
 
