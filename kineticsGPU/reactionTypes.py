@@ -333,6 +333,149 @@ class ElementaryReactionBatch:
 
         return w
 
+    def jvp(self, T, C, v_T, v_C):
+        """
+        Jacobian-vector product for species production rates w.r.t perturbations (v_T, v_C).
+        Inputs:
+            T:  (ncells,) temperature
+            C:  (ncells, n_species) concentrations
+            v_T:(ncells,) perturbation in T
+            v_C:(ncells, n_species) perturbation in C
+        Returns:
+            Jv_w: (ncells, n_species) = (d omega / d[T,C]) · [v_T, v_C]
+        Notes:
+            - Uses same eps clamping as RR().
+            - Fully vectorized (no Python loops).
+        """
+        print('WARNING, NO PHYSICAL VALIDATION OF THIS CLASS')
+        ncells = T.shape[0]
+        device = self.device
+        dtype = self.dtype
+
+        # --- Precompute kf, Kc, conc_r, conc_p (re-using RR code patterns) ---
+        kf = self.kf(T)  # (ncells, n_reactions)
+        Kc = self.Kc(T)  # (ncells, n_reactions)
+
+        C_safe = torch.clamp(C, min=self.eps)
+        logC_r = torch.log(C_safe[:, self.react_idx])  # (ncells, n_total_react)
+        logC_p = torch.log(C_safe[:, self.prod_idx])
+
+        # Build per-reaction log-sum and exponentiate -> conc_r, conc_p
+        conc_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        conc_p = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
+
+        conc_r = conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                     logC_r * self.react_sto[None, :])
+        conc_p = conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                     logC_p * self.prod_sto[None, :])
+
+        conc_r = torch.exp(conc_r)  # (ncells, n_reactions)
+        conc_p = torch.exp(conc_p)
+
+        # --- Reaction rate RR (for reuse in dRR/dT formula) ---
+        RR = kf * (conc_r - (1.0 - self.oneWay[None, :]) * conc_p / Kc)
+
+        # --- d kf / dT ---
+        # dkf/dT = kf * ( n/T + Ea/(R*T^2) )
+        T_exp = T[:, None]  # (ncells,1)
+        dkf_dT = kf * (self.n[None, :] / T_exp + self.Ea[None, :] / (R * T_exp * T_exp))
+
+        # --- dKc/dT analytic ---
+        # Recompute quantities used in Kc(): G0_r, G0_p and s_r, s_p to get deltaG0 and deltaS
+        # Note: we re-use the same thermo calls as Kc()
+        h_r = self.thermo.h_species(T, self.react_idx)  # (ncells, n_total_react)
+        s_r = self.thermo.s_species_Pref(T, self.react_idx)
+        h_p = self.thermo.h_species(T, self.prod_idx)
+        s_p = self.thermo.s_species_Pref(T, self.prod_idx)
+
+        G0_r = h_r - T[:, None] * s_r
+        G0_p = h_p - T[:, None] * s_p
+
+        # Sum contributions per reaction (like in Kc)
+        deltaG0_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        deltaG0_p = torch.zeros_like(deltaG0_r)
+
+        sto_r_exp = self.react_sto[None, :]
+        sto_p_exp = self.prod_sto[None, :]
+
+        deltaG0_r = deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                           sto_r_exp * G0_r)
+        deltaG0_p = deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                           sto_p_exp * G0_p)
+
+        deltaG0 = deltaG0_p - deltaG0_r  # (ncells, n_reactions)
+
+        # sum s per reaction
+        deltaS_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        deltaS_p = torch.zeros_like(deltaS_r)
+
+        deltaS_r = deltaS_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                         sto_r_exp * s_r)
+        deltaS_p = deltaS_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                         sto_p_exp * s_p)
+
+        deltaS = deltaS_p - deltaS_r  # Δs
+
+        # d ln Kc / dT = Δs/(R*T) + ΔG0/(R*T^2) - Δn / T
+        dlnKc_dT = deltaS / (R * T_exp) + deltaG0 / (R * T_exp * T_exp) - self.delta_n[None, :] / T_exp
+        dKc_dT = Kc * dlnKc_dT  # (ncells, n_reactions)
+
+        # --- dRR / dT  ---
+        # dRR/dT = dkf/dT * (conc_r - (1-oneWay)*conc_p/Kc) + kf * (1-oneWay) * conc_p / Kc^2 * dKc/dT
+        factor = (1.0 - self.oneWay[None, :])
+        dRR_dT = dkf_dT * (conc_r - factor * conc_p / Kc) + kf * (factor * conc_p / (Kc * Kc) * dKc_dT)
+        # shape: (ncells, n_reactions)
+
+        # --- Contribution to RR from temperature perturbation ---
+        # dRR_dT * v_T expands to per-reaction scalar
+        dRR_from_T_v = dRR_dT * v_T[:, None]  # (ncells, n_reactions)
+
+        # --- dRR / dC · v_C  (use flattened lists, then scatter_add to reactions) ---
+        # For reactants: term = kf_j * conc_r_j * (nu / C_i) * vC_i   (sum over reactant species i in reaction j)
+        # For products: term = - kf_j * (1-oneWay_j)/Kc_j * conc_p_j * (nu / C_i) * vC_i
+
+        # flattened per-entry conc and kf
+        conc_r_flat = conc_r[:, idx_r_scatter]  # (ncells, n_total_react)
+        conc_p_flat = conc_p[:, idx_p_scatter]  # (ncells, n_total_prod)
+
+        kf_r_flat = kf[:, idx_r_scatter]  # (ncells, n_total_react)
+        kf_p_flat = kf[:, idx_p_scatter]  # (ncells, n_total_prod)
+
+        # denominators and vC for the species indices in flattened lists
+        denom_r = C_safe[:, self.react_idx]  # (ncells, n_total_react)
+        denom_p = C_safe[:, self.prod_idx]  # (ncells, n_total_prod)
+
+        vC_r = v_C[:, self.react_idx]  # (ncells, n_total_react)
+        vC_p = v_C[:, self.prod_idx]  # (ncells, n_total_prod)
+
+        # per-entry contributions
+        contrib_r_flat = kf_r_flat * conc_r_flat * (self.react_sto[None, :] / denom_r) * vC_r
+        contrib_p_flat = - kf_p_flat * ((1.0 - self.oneWay)[None, idx_p_scatter] / Kc[:, idx_p_scatter]) \
+                         * conc_p_flat * (self.prod_sto[None, :] / denom_p) * vC_p
+
+        # scatter-add per-reaction
+        dRR_from_C_v = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+
+        # reactants contribution
+        dRR_from_C_v = dRR_from_C_v.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), contrib_r_flat)
+
+        # products contribution
+        dRR_from_C_v = dRR_from_C_v.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), contrib_p_flat)
+
+        # --- total dRR · v (per reaction) ---
+        dRR_v = dRR_from_T_v + dRR_from_C_v  # (ncells, n_reactions)
+
+        # --- map per-reaction changes to species via same stoich mapping as omega_from_RR ---
+        Jv_w = self.omega_from_RR(dRR_v)  # (ncells, n_species) - linear in RR so re-use
+
+        return Jv_w
+
+
+
+
 
 class ThreeBodyReaction(ElementaryReaction):
     """
@@ -565,7 +708,151 @@ class ThreeBodyReactionBatch:
 
         return w
 
+    def jvp(self, T, C, v_T, v_C):
+        """
+        Jacobian-vector product for species production rates w.r.t perturbations (v_T, v_C)
+        for three-body reaction batch.
 
+        Inputs:
+            T:   (ncells,) temperature
+            C:   (ncells, n_species) concentrations
+            v_T: (ncells,) perturbation in T
+            v_C: (ncells, n_species) perturbation in C
+
+        Returns:
+            Jv_w: (ncells, n_species) = (d omega / d[T,C]) · [v_T, v_C]
+
+        Notes:
+            - Matches eps/clamping and vectorized style used in Elementary implementation.
+            - Fully vectorized (no Python loops).
+        """
+        print('WARNING, NO PHYSICAL VALIDATION OF THIS CLASS')
+        ncells = T.shape[0]
+        device = self.device
+        dtype = self.dtype
+
+        # --- Precompute kf, Kc, conc_r, conc_p (re-using RR code patterns) ---
+        kf = self.kf(T)  # (ncells, n_reactions)
+        Kc = self.Kc(T)  # (ncells, n_reactions)
+
+        C_safe = torch.clamp(C, min=self.eps)
+        logC_r = torch.log(C_safe[:, self.react_idx])  # (ncells, n_total_react)
+        logC_p = torch.log(C_safe[:, self.prod_idx])
+
+        # Build per-reaction log-sum and exponentiate -> conc_r, conc_p
+        conc_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        conc_p = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
+
+        conc_r = conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                     logC_r * self.react_sto[None, :])
+        conc_p = conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                     logC_p * self.prod_sto[None, :])
+
+        conc_r = torch.exp(conc_r)  # (ncells, n_reactions)
+        conc_p = torch.exp(conc_p)
+
+        # --- Reaction base rate (without [M]) ---
+        baseRR = kf * (conc_r - (1.0 - self.oneWay[None, :]) * conc_p / Kc)  # (ncells, n_reactions)
+
+        # --- M and its perturbation ---
+        M = self.M_concentration(C)  # (ncells, n_reactions)
+        # dM/dC · v_C = v_C @ eff_matrix.T
+        dM_from_C_v = torch.matmul(v_C, self.eff_matrix.t())  # (ncells, n_reactions)
+
+        # Full RR = baseRR * M
+        RR = baseRR * M
+
+        # --- d kf / dT ---
+        T_exp = T[:, None]
+        dkf_dT = kf * (self.n[None, :] / T_exp + self.Ea[None, :] / (R * T_exp * T_exp))
+
+        # --- dKc/dT analytic ---
+        # Recompute quantities used in Kc(): G0_r, G0_p and s_r, s_p to get deltaG0 and deltaS
+        h_r = self.thermo.h_species(T, self.react_idx)
+        s_r = self.thermo.s_species_Pref(T, self.react_idx)
+        h_p = self.thermo.h_species(T, self.prod_idx)
+        s_p = self.thermo.s_species_Pref(T, self.prod_idx)
+
+        G0_r = h_r - T[:, None] * s_r
+        G0_p = h_p - T[:, None] * s_p
+
+        deltaG0_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        deltaG0_p = torch.zeros_like(deltaG0_r)
+
+        sto_r_exp = self.react_sto[None, :]
+        sto_p_exp = self.prod_sto[None, :]
+
+        deltaG0_r = deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                           sto_r_exp * G0_r)
+        deltaG0_p = deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                           sto_p_exp * G0_p)
+
+        deltaG0 = deltaG0_p - deltaG0_r  # (ncells, n_reactions)
+
+        # sum s per reaction
+        deltaS_r = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+        deltaS_p = torch.zeros_like(deltaS_r)
+
+        deltaS_r = deltaS_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1),
+                                         sto_r_exp * s_r)
+        deltaS_p = deltaS_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1),
+                                         sto_p_exp * s_p)
+
+        deltaS = deltaS_p - deltaS_r  # Δs
+
+        # d ln Kc / dT = Δs/(R*T) + ΔG0/(R*T^2) - Δn / T
+        dlnKc_dT = deltaS / (R * T_exp) + deltaG0 / (R * T_exp * T_exp) - self.delta_n[None, :] / T_exp
+        dKc_dT = Kc * dlnKc_dT  # (ncells, n_reactions)
+
+        # --- d(baseRR) / dT  ---
+        factor = (1.0 - self.oneWay[None, :])
+        dbaseRR_dT = dkf_dT * (conc_r - factor * conc_p / Kc) + kf * (factor * conc_p / (Kc * Kc) * dKc_dT)
+        # shape: (ncells, n_reactions)
+
+        # Contribution to RR from temperature perturbation: d(baseRR)/dT * v_T * M
+        dRR_from_T_v = dbaseRR_dT * v_T[:, None] * M
+
+        # --- d(baseRR) / dC · v_C  (use flattened lists, then scatter_add to reactions) ---
+        # For reactants: term = kf_j * conc_r_j * (nu / C_i) * vC_i   (sum over reactant species i in reaction j)
+        # For products: term = - kf_j * (1-oneWay_j)/Kc_j * conc_p_j * (nu / C_i) * vC_i
+
+        conc_r_flat = conc_r[:, idx_r_scatter]  # (ncells, n_total_react)
+        conc_p_flat = conc_p[:, idx_p_scatter]  # (ncells, n_total_prod)
+
+        kf_r_flat = kf[:, idx_r_scatter]
+        kf_p_flat = kf[:, idx_p_scatter]
+
+        denom_r = C_safe[:, self.react_idx]
+        denom_p = C_safe[:, self.prod_idx]
+
+        vC_r = v_C[:, self.react_idx]
+        vC_p = v_C[:, self.prod_idx]
+
+        contrib_r_flat = kf_r_flat * conc_r_flat * (self.react_sto[None, :] / denom_r) * vC_r
+        contrib_p_flat = - kf_p_flat * ((1.0 - self.oneWay)[None, idx_p_scatter] / Kc[:, idx_p_scatter]) \
+                         * conc_p_flat * (self.prod_sto[None, :] / denom_p) * vC_p
+
+        dbaseRR_from_C_v = torch.zeros((ncells, self.n_reactions), device=device, dtype=dtype)
+
+        # reactants contribution
+        dbaseRR_from_C_v = dbaseRR_from_C_v.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), contrib_r_flat)
+
+        # products contribution
+        dbaseRR_from_C_v = dbaseRR_from_C_v.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), contrib_p_flat)
+
+        # Now include effects of M: dRR_from_C_v = (d baseRR / dC · vC) * M  + baseRR * dM/dC · vC
+        dRR_from_C_v = dbaseRR_from_C_v * M + baseRR * dM_from_C_v
+
+        # --- total dRR · v (per reaction) ---
+        dRR_v = dRR_from_T_v + dRR_from_C_v  # (ncells, n_reactions)
+
+        # --- map per-reaction changes to species via same stoich mapping as omega_from_RR ---
+        Jv_w = self.omega_from_RR(dRR_v)  # (ncells, n_species)
+
+        return Jv_w
 
 
 class FalloffReaction(ElementaryReaction):

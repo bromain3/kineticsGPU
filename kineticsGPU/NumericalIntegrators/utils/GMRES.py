@@ -276,6 +276,7 @@ def gmres_givens_batched(
 
     # timing accumulators
     timers = {
+        "matvec_call": 0,
         "matvec": 0.0,
         "m_inv": 0.0,
         "proj": 0.0,
@@ -305,6 +306,7 @@ def gmres_givens_batched(
             vj = V[:, j, :]
 
             w = matvec(vj).detach()
+            timers["matvec_call"] += 1
             timers["matvec"] += (time.time() - t0)
 
             t0 = time.time()
@@ -402,6 +404,7 @@ def gmres_givens_batched(
         # compute residual and test convergence
         t0 = time.time()
         r = (rhs - matvec(x).detach()).detach()
+        timers["matvec_call"] += 1
         timers["residual_matvec"] += (time.time() - t0)
 
         res_norms = torch.norm(r, dim=1)

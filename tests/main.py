@@ -104,6 +104,7 @@ for i, r in enumerate(list):
     """
 print(time.perf_counter() - t0)
 t0 = time.perf_counter()
+#omega = batched_elem.jvp(T, C, T, C)
 omega = batched_elem.RR(T, C)
 print(time.perf_counter() - t0)
 
@@ -205,18 +206,13 @@ def rhs_adiabatic(TC, t):
     dCdt = reaction_system.omega_total(T, C)
 
     # total molar concentration (mol/m3)
-    n_tot = torch.sum(C, dim=1)  # (N,)
+    n_tot = torch.sum(C, dim=1)
     # mole fractions X = C / n_tot
-    X = C / n_tot[:, None]  # (N, nspecies)
+    X = C / n_tot[:, None]
     # mixture molar Cv (J/mol/K)
     cv_mol_mix = vec_th.cv_mix_mol(T, X)  # (N,)
-    # dH_molar/dt = Σ_i h_i(T) * dC_i/dt  (J/m3/s)
-    dHdt_molar = vec_th.h_mix_mol(T, dCdt)  # (N,)
-    # d(n_tot)/dt = Σ_i dC_i/dt
-    #dn_dt = torch.sum(dCdt, dim=1)  # (N,)
+    dHdt_molar = vec_th.h_mix_mol(T, dCdt)
 
-    # final dT/dt (K/s) — full expression including R*T*dn/dt term
-    #dTdt = - (dHdt_molar - R * T * dn_dt) / (n_tot * cv_mol_mix)
     dTdt = - (dHdt_molar) / (n_tot * cv_mol_mix)
 
     # assemble result
@@ -235,7 +231,7 @@ print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
 Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1000, 1)                     # shape (batch_size, state) => odeint will accept
-integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True)
+integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True, gmres_restart=20)
 integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
 integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
 t0 = time.perf_counter()
