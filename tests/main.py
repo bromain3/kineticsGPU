@@ -228,26 +228,35 @@ def rhs_adiabatic(TC, t):
 # === INTÉGRATION ===
 from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
 from kineticsGPU.NumericalIntegrators.RKF45 import AdaptiveExplicitRKF45
+from kineticsGPU.NumericalIntegrators.BDFAdaTsTorch import AdaptiveImplicitIntegrator
 dt = 1e-6
 t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
 Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1000, 1)                     # shape (batch_size, state) => odeint will accept
-integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
+integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True)
 integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
+integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
 t0 = time.perf_counter()
 
 for i, t in enumerate(t_eval_torch):
     print(Y0)
-    Y0 = integrator.step(Y0, t, dt, method='gmres', precond='identity') #TODO: investigate GPU memory increasing during integration
+    Y0 = integrator.step(Y0, t, dt, method='gmres', precond='identity') # TODO: investigate memory issue with chemistry preconditioning
+    #Y0 = integratorAda.step_adaptive(Y0, t, dt, method='trapezoid', linear_solver='gmres', precond='identity')
 
 #t = 0.0
 #h = dt
 #while t < t_eval_torch[-1].item():
-#    Y0, h = integratorrkf45.step_adaptive(Y0, t, dt, atol=1e-8, rtol=1e-8, safety=0.9, controller='PI', verbose=False)
-#    t+=h
-#    print(t)
+    #Y0, h = integratorrkf45.step_adaptive(Y0, t, dt, atol=1e-8, rtol=1e-8, safety=0.9, controller='PI', verbose=False)
+    #Y0, h = integratorAda.step_adaptive(Y0, t, h, method='backward_euler', linear_solver='gmres', precond='identity', jacobian_reuse=1)
+    #print('\n\n\n\n')
+    #print(Y0)
+    #print('\n\n\n\n')
+    #print(h)
+    #print('\n\n\n\n')
+    #t+=h
+    #print(t)
 
 #sol_torch = odeint(rhs_adiabatic, Y0, t_eval_torch, method='trbdf2')  # shape (n_points, state)
 print(time.perf_counter() - t0)
