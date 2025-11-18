@@ -138,6 +138,13 @@ class ElementaryReactionBatch:
         self.n = torch.tensor(n, dtype=dtype, device=device)
         self.Ea = torch.tensor(Ea, dtype=dtype, device=device)
 
+        self.idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_r)
+        )
+        self.idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
+            torch.diff(self.reaction_offsets_p)
+        )
+
         self.delta_n = torch.tensor(
             [torch.sum(r.products_sto) - torch.sum(r.reactants_sto) for r in reactions],
             dtype=dtype, device=device
@@ -203,19 +210,15 @@ class ElementaryReactionBatch:
         deltaG0_p = torch.zeros_like(deltaG0_r)
 
         # Compute indices for scatter
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_r)
-        )
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_p)
-        )
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
         # Expand stoichiometry to (ncells, n_total)
         sto_r_exp = self.react_sto[None, :]
         sto_p_exp = self.prod_sto[None, :]
 
-        deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r)
-        deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p)
+        deltaG0_r = deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r) # not in place fonction to make it compatible with vmap and torch.compile
+        deltaG0_p = deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p) # not in place fonction to make it compatible with vmap and torch.compile
 
         deltaG0 = deltaG0_p - deltaG0_r
         Kp = torch.exp(-deltaG0 / (R * T[:, None]))
@@ -277,13 +280,11 @@ class ElementaryReactionBatch:
         conc_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         conc_p = torch.zeros_like(conc_r)
 
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_r))
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_p))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
-        conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :])
-        conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :])
+        conc_r = conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
+        conc_p = conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
 
         conc_r = torch.exp(conc_r)
         conc_p = torch.exp(conc_p)
@@ -308,8 +309,8 @@ class ElementaryReactionBatch:
         sto_r = self.react_sto              # stoichiometric coefficients
 
         # map each flattened react entry to its reaction index
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_r))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
         # expand RR to match flattened react list
         RR_exp_r = RR[:, idx_r_scatter]     # (ncells, n_total_react)
@@ -318,19 +319,17 @@ class ElementaryReactionBatch:
         contrib_r = -sto_r[None, :] * RR_exp_r
 
         # scatter add on species axis
-        w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r)
+        w = w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r) # not in place fonction to make it compatible with vmap and torch.compile
 
         # ---------- Products: production ----------
         idx_p = self.prod_idx
         sto_p = self.prod_sto
 
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_p))
 
         RR_exp_p = RR[:, idx_p_scatter]
         contrib_p = sto_p[None, :] * RR_exp_p
 
-        w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
+        w = w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p) # not in place fonction to make it compatible with vmap and torch.compile
 
         return w
 
@@ -451,6 +450,15 @@ class ThreeBodyReactionBatch:
             dtype=dtype, device=device
         )
         self.eff_matrix = torch.stack([r.eff for r in reactions], dim=0).to(device=device, dtype=dtype)
+        # counts per reaction in flattened react/product lists
+        counts_r = torch.diff(self.reaction_offsets_r)   # length = n_reactions
+        counts_p = torch.diff(self.reaction_offsets_p)
+
+        # idx_r_scatter: for each flattened react entry, the reaction index it belongs to
+        # shape = (n_total_react_entries,)
+        self.idx_r_scatter = torch.arange(self.n_reactions, device=device).repeat_interleave(counts_r)
+        self.idx_p_scatter = torch.arange(self.n_reactions, device=device).repeat_interleave(counts_p)
+
 
     # ----- Arrhenius -----
     def kf(self, T):
@@ -468,12 +476,12 @@ class ThreeBodyReactionBatch:
         G0_p = h_p - T[:, None] * s_p
         deltaG0_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         deltaG0_p = torch.zeros_like(deltaG0_r)
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_r))
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_p))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
         sto_r_exp = self.react_sto[None, :]
         sto_p_exp = self.prod_sto[None, :]
-        deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r)
-        deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p)
+        deltaG0_r = deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r) # not in place fonction to make it compatible with vmap and torch.compile
+        deltaG0_p = deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p) # not in place fonction to make it compatible with vmap and torch.compile
         deltaG0 = deltaG0_p - deltaG0_r
         Kp = torch.exp(-deltaG0 / (R * T[:, None]))
         Kc = Kp * (Pref / (R * T[:, None])) ** self.delta_n[None, :]
@@ -502,11 +510,11 @@ class ThreeBodyReactionBatch:
         conc_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         conc_p = torch.zeros_like(conc_r)
 
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_r))
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_p))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
-        conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :])
-        conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :])
+        conc_r = conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
+        conc_p = conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
 
         conc_r = torch.exp(conc_r)
         conc_p = torch.exp(conc_p)
@@ -533,8 +541,7 @@ class ThreeBodyReactionBatch:
         sto_r = self.react_sto              # stoichiometric coefficients
 
         # map each flattened react entry to its reaction index
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_r))
+        idx_r_scatter = self.idx_r_scatter
 
         # expand RR to match flattened react list
         RR_exp_r = RR[:, idx_r_scatter]     # (ncells, n_total_react)
@@ -543,19 +550,18 @@ class ThreeBodyReactionBatch:
         contrib_r = -sto_r[None, :] * RR_exp_r
 
         # scatter add on species axis
-        w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r)
+        w = w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r) # not in place fonction to make it compatible with vmap and torch.compile
 
         # ---------- Products: production ----------
         idx_p = self.prod_idx
         sto_p = self.prod_sto
 
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(
-            torch.diff(self.reaction_offsets_p))
+        idx_p_scatter = self.idx_p_scatter
 
         RR_exp_p = RR[:, idx_p_scatter]
         contrib_p = sto_p[None, :] * RR_exp_p
 
-        w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
+        w = w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p) # not in place fonction to make it compatible with vmap and torch.compile
 
         return w
 
@@ -885,6 +891,15 @@ class FalloffReactionBatch:
 
         self.delta_n = torch.tensor(delta_n_list, dtype=dtype, device=device)  # (n_reactions,)
 
+        # counts per reaction in flattened react/product lists
+        counts_r = torch.diff(self.reaction_offsets_r)   # length = n_reactions
+        counts_p = torch.diff(self.reaction_offsets_p)
+
+        # idx_r_scatter: for each flattened react entry, the reaction index it belongs to
+        # shape = (n_total_react_entries,)
+        self.idx_r_scatter = torch.arange(self.n_reactions, device=device).repeat_interleave(counts_r)
+        self.idx_p_scatter = torch.arange(self.n_reactions, device=device).repeat_interleave(counts_p)
+
     # ----- k0 and kinf vectorized over T array -----
     def _k0_T(self, T):
         # T: (ncells,)
@@ -1020,14 +1035,14 @@ class FalloffReactionBatch:
         deltaG0_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         deltaG0_p = torch.zeros_like(deltaG0_r)
 
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_r))
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_p))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
         sto_r_exp = self.react_sto[None, :]
         sto_p_exp = self.prod_sto[None, :]
 
-        deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r)
-        deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p)
+        deltaG0_r = deltaG0_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), sto_r_exp * G0_r) # not in place fonction to make it compatible with vmap and torch.compile
+        deltaG0_p = deltaG0_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), sto_p_exp * G0_p) # not in place fonction to make it compatible with vmap and torch.compile
 
         deltaG0 = deltaG0_p - deltaG0_r
         Kp = torch.exp(-deltaG0 / (R * T[:, None]))
@@ -1054,11 +1069,11 @@ class FalloffReactionBatch:
         conc_r = torch.zeros((ncells, self.n_reactions), device=self.device, dtype=self.dtype)
         conc_p = torch.zeros_like(conc_r)
 
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_r))
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_p))
+        idx_r_scatter = self.idx_r_scatter
+        idx_p_scatter = self.idx_p_scatter
 
-        conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :])
-        conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :])
+        conc_r = conc_r.scatter_add_(1, idx_r_scatter[None, :].expand(ncells, -1), logC_r * self.react_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
+        conc_p = conc_p.scatter_add_(1, idx_p_scatter[None, :].expand(ncells, -1), logC_p * self.prod_sto[None, :]) # not in place fonction to make it compatible with vmap and torch.compile
 
         conc_r = torch.exp(conc_r)
         conc_p = torch.exp(conc_p)
@@ -1082,22 +1097,22 @@ class FalloffReactionBatch:
         idx_r = self.react_idx
         sto_r = self.react_sto
         # scatter add -nu_r * RR
-        idx_r_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_r))
+        idx_r_scatter = self.idx_r_scatter
         # expand RR to match flattened list then accumulate per species
         # build matrix (ncells, n_flat) = RR[:, idx_r_scatter]
         RR_exp_r = RR[:, idx_r_scatter]
         # contribution per flattened entry: -sto_r[None,:] * RR_exp_r
         contrib_r = -sto_r[None, :] * RR_exp_r
         # scatter add along species axis
-        w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r)
+        w = w.scatter_add_(1, idx_r[None, :].expand(ncells, -1), contrib_r) # not in place fonction to make it compatible with vmap and torch.compile
 
         # products (production)
         idx_p = self.prod_idx
         sto_p = self.prod_sto
-        idx_p_scatter = torch.arange(self.n_reactions, device=self.device).repeat_interleave(torch.diff(self.reaction_offsets_p))
+        idx_p_scatter = self.idx_p_scatter
         RR_exp_p = RR[:, idx_p_scatter]
         contrib_p = sto_p[None, :] * RR_exp_p
-        w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p)
+        w = w.scatter_add_(1, idx_p[None, :].expand(ncells, -1), contrib_p) # not in place fonction to make it compatible with vmap and torch.compile
 
         return w
 
