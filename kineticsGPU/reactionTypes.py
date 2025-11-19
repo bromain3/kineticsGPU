@@ -1447,6 +1447,8 @@ class FalloffReactionBatch:
         # dk0/dT = k0 * (b_k0/T + Ea_k0/(R*T^2))
         dk0_dT = k0 * (self.b_k0[None, :] / T_exp + self.Ea_k0[None, :] / (R * T_exp * T_exp))
         dkinf_dT = kinf * (self.b_kinf[None, :] / T_exp + self.Ea_kinf[None, :] / (R * T_exp * T_exp))
+        kinf_mask = kinf > self.eps
+        dkinf_dT = torch.where(kinf_mask, dkinf_dT, torch.zeros_like(dkinf_dT))
 
         # M and its perturbation
         M = self.M_concentration(C)  # (ncells, n_reactions)
@@ -1455,15 +1457,18 @@ class FalloffReactionBatch:
         # Pr and safe
         kinf_safe = torch.clamp(kinf, min=self.eps)
         Pr = (k0 * M) / kinf_safe
+        pr_mask = Pr > self.eps
         Pr_safe = torch.clamp(Pr, min=self.eps)
 
         # derivatives of Pr
         # dPr/dT = (dk0/dT * M - k0 * dkinf/dT * M / kinf_safe) / kinf_safe
         # using quotient rules carefully
         dPr_dT = (dk0_dT * M - k0 * (dkinf_dT) * M / kinf_safe) / kinf_safe
+        dPr_dT = torch.where(pr_mask, dPr_dT, torch.zeros_like(dPr_dT))
         # dPr/dC · v = (k0/kinf) * dM/dC · v
         k0_over_kinf = k0 / kinf_safe
         dPr_from_C_v = k0_over_kinf * dM_from_C_v
+        dPr_from_C_v = torch.where(pr_mask, dPr_from_C_v, torch.zeros_like(dPr_from_C_v))
 
         # --- Falloff factor F and its derivatives ---
         # Build F like in _F_matrix but keep intermediate quantities for derivatives
@@ -1520,7 +1525,9 @@ class FalloffReactionBatch:
         logFcent = torch.log10(Fcent)
         # d(log10 Fcent)/dT = (1 / (Fcent * ln(10))) * dFcent/dT
         inv_ln10 = 1.0 / math.log(10.0)
+        fcent_mask = Fcent > self.eps
         dlogFcent_dT = (dFcent_dT / Fcent) * inv_ln10
+        dFcent_dT = torch.where(fcent_mask, dFcent_dT, torch.zeros_like(dFcent_dT))
 
         C_par = -0.4 - 0.67 * logFcent
         N_par = 0.75 - 1.27 * logFcent
@@ -1529,7 +1536,8 @@ class FalloffReactionBatch:
 
         # guard Pr for log10
         logPr = torch.log10(Pr_safe)
-        dlogPr_dPr = 1.0 / (Pr_safe * math.log(10.0))
+        dlogPr_dPr = torch.where(pr_mask, 1.0 / (Pr_safe * math.log(10.0)), torch.zeros_like(Pr_safe))
+
 
 
         # f1 numerator/denominator
@@ -1543,11 +1551,14 @@ class FalloffReactionBatch:
         # df1/dPr = (dlogPr_dPr * denominator - numerator * (-0.14 * dlogPr_dPr)) / denominator^2
         denom_sq = denominator * denominator
         df1_dPr = (dlogPr_dPr * denominator + 0.14 * numerator * dlogPr_dPr) / denom_sq
+        denom_mask = (denominator != 0.0)
+        df1_dPr = torch.where(denom_mask, df1_dPr, torch.zeros_like(df1_dPr))
 
         # df1/dT: numerator_T = dCpar_dT, denominator_T = dNpar_dT - 0.14 * dCpar_dT
         numerator_T = dCpar_dT
         denominator_T = dNpar_dT - 0.14 * dCpar_dT
         df1_dT = (numerator_T * denominator - numerator * denominator_T) / denom_sq
+        df1_dT = torch.where(denom_mask, df1_dT, torch.zeros_like(df1_dT))
 
         # exponent = logFcent / (1 + f1^2)
         denom_f = (1.0 + f1_sq)
