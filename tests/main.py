@@ -220,6 +220,55 @@ def rhs_adiabatic(TC, t):
 
     return dTCdt
 
+def jvp_rhs_adiabatic(TC, t, dTC):
+    T = TC[:, 0]
+    C = TC[:, 1:]
+
+    v_T = dTC[:, 0]
+    v_C = dTC[:, 1:]
+
+    dCdt_jvp = reaction_system.jvp(T, C, v_T, v_C)
+    dCdt = reaction_system.omega_total(T, C) # try to avoid recomputing using rhs_adiabatic value
+
+
+    # ---- Compute n_tot and derivatives ----
+    n_tot = torch.sum(C, dim=1)                      # (N,)
+    dn_tot = torch.sum(v_C, dim=1)                   # (N,)
+
+    # ---- Thermodynamic species properties ----
+    cp_species = vec_th.cp_species(T, torch.arange(len(vec_th.species)))   # (N, ns)
+    cv_species = cp_species - yaml_thermo.R
+
+    # ---- Mixture cv ----
+    X = C / n_tot[:, None]
+    cv_mix = vec_th.cv_mix_mol(T, X)                 # (N,)
+    # derivative wrt T:
+    dcp_dT = vec_th.dcp_species_dT(T, torch.arange(len(vec_th.species)))                 # (N, ns)
+    dcv_dT = dcp_dT                                  # since cv = cp - R
+
+    # ---- derivative of X ----
+    dX = (v_C / n_tot[:, None]) - (C * dn_tot[:, None] / (n_tot**2)[:, None])
+
+    # ---- dc_v mix ----
+    dcv_mix = torch.sum(dX * cv_species, dim=1) + torch.sum(X * dcv_dT, dim=1) * v_T
+
+    # ---- H' ----
+    h_species = vec_th.h_species(T, torch.arange(len(vec_th.species)))
+
+    H_prime = torch.sum(h_species * dCdt, dim=1)
+
+    # ---- dH' ----
+    dH_prime = torch.sum(h_species * dCdt_jvp, dim=1) \
+               + torch.sum(dCdt * cp_species, dim=1) * v_T
+
+    # ---- final dT' ----
+    dT_prime = (
+          - dH_prime / (n_tot * cv_mix)
+          +  H_prime * dn_tot / (n_tot**2 * cv_mix)
+          +  H_prime * dcv_mix / (n_tot * cv_mix**2)
+    )
+    return torch.cat([dT_prime[:, None], dCdt_jvp], dim=1)
+
 
 # === INTÉGRATION ===
 from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
@@ -230,10 +279,15 @@ t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
-Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1000, 1)                     # shape (batch_size, state) => odeint will accept
-integrator = BackwardEulerIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True, gmres_restart=20)
+Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(10000, 1)                     # shape (batch_size, state) => odeint will accept
+integrator = BackwardEulerIntegrator(rhs_adiabatic, jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True, gmres_restart=20)
 integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
 integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
+
+t0 = time.perf_counter()
+jvp = jvp_rhs_adiabatic(Y0, 0.0, Y0)
+print('jvp:', time.perf_counter() - t0)
+
 t0 = time.perf_counter()
 
 for i, t in enumerate(t_eval_torch):

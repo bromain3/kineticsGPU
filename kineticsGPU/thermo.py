@@ -287,6 +287,31 @@ class ThermoData_vectorized:
         cp_species_molar = R * torch.sum(coef * Temp, dim=-1)  # (ncells, n_idx)
         return cp_species_molar
 
+    def dcp_species_dT(self, T, idx):
+        """
+        Dérivée par rapport à T des chaleurs spécifiques molaires cp (J/mol/K^2)
+        pour les espèces listées dans idx.
+
+        T : (ncells,)
+        idx : indices des espèces (Tensor or list)
+
+        Retour :
+            dcp_dT : (ncells, n_idx), dérivée dc_p/dT analytique
+        """
+
+        T = T[:, None]  # (ncells, 1)
+        coef = self._select_coef(T)[:, idx, 1:5]  # (ncells, n_idx, 5)
+
+        # Puissances de T
+        T2 = T * T
+        T3 = T2 * T
+
+        # dcp/dT analytique
+        Temp = torch.stack([torch.ones_like(T), 2.0 * T, 3.0 * T2, 4.0 * T3], dim=-1)
+        dcp_dT = R * torch.sum(coef * Temp, dim=-1)
+
+        return dcp_dT
+
     def h_species(self, T, idx, P=Pref):
         """
         Enthalpie molaire (J/mol) pour les espèces d'indice idx.

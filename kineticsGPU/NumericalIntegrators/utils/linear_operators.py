@@ -28,3 +28,9 @@ def make_matvec_fd(f: Callable[[torch.Tensor, float], torch.Tensor], x: torch.Te
 
 
     return matvec
+
+def make_matvec_user_defined(jvp: Callable[[torch.Tensor, float, torch.Tensor], torch.Tensor], x: torch.Tensor, t: float, h: float, eps: Optional[float] = None) -> Callable[[torch.Tensor], torch.Tensor]:
+    def matvec(v: torch.Tensor) -> torch.Tensor:
+        jv = jvp(x, t, v)
+        return v - h * jv
+    return matvec

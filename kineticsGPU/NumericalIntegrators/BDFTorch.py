@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import torch
 from kineticsGPU.NumericalIntegrators.utils.utils import ensure_batch_dim, one
 from kineticsGPU.NumericalIntegrators.utils.residual import compute_residual
-from kineticsGPU.NumericalIntegrators.utils.linear_operators import make_matvec_autograd, make_matvec_fd
+from kineticsGPU.NumericalIntegrators.utils.linear_operators import make_matvec_autograd, make_matvec_fd, make_matvec_user_defined
 from kineticsGPU.NumericalIntegrators.utils.preconditioners import identity_precond, make_jacobi_autograd, chemistry_preconditioner
 from kineticsGPU.NumericalIntegrators.utils.dense import dense_solve
 from kineticsGPU.NumericalIntegrators.utils.GMRES import gmres_solve, gmres_givens_batched, gmres_solve_batched
@@ -27,6 +27,7 @@ from kineticsGPU.NumericalIntegrators.utils.GMRES import gmres_solve, gmres_give
 class BackwardEulerIntegrator:
     def __init__(self,
                 f: Callable[[torch.Tensor, float], torch.Tensor],
+                jvp: Optional[Callable[[torch.Tensor, float, torch.Tensor], torch.Tensor]] = None,
                 device: Optional[torch.device] = None,
                 dtype: Optional[torch.dtype] = None,
                 newton_tol: float = 1e-6,
@@ -37,6 +38,7 @@ class BackwardEulerIntegrator:
                 verbose: bool = False,
                 use_autograd_jvp: bool = True):
         self.f = f
+        self.jvp = jvp
         self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
         self.dtype = dtype or torch.float32
         self.newton_tol = newton_tol
@@ -92,10 +94,15 @@ class BackwardEulerIntegrator:
 
             rhs = (-F).detach()
 
-            if self.use_autograd_jvp and method == 'gmres':
-                matvec = make_matvec_autograd(self.f, x_lin, t_new, h)
+            if self.jvp is not None:
+                matvec = make_matvec_user_defined(self.jvp, x_lin, t_new, h)
+
             else:
-                matvec = make_matvec_fd(self.f, x_lin, t_new, h)
+                # fallback to autograd or finite differences
+                if self.use_autograd_jvp and method == 'gmres':
+                    matvec = make_matvec_autograd(self.f, x_lin, t_new, h)
+                else:
+                    matvec = make_matvec_fd(self.f, x_lin, t_new, h)
 
             if method == 'dense':
                 dx = dense_solve(self.f, x_lin, t_new, h, rhs)
