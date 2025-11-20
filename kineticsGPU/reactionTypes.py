@@ -38,6 +38,11 @@ class ElementaryReaction:
         self.n = torch.tensor(n, device=device, dtype=dtype)
         self.Ea = torch.tensor(Ea, device=device, dtype=dtype)
 
+        # vecteur stoechiométrique global
+        self.nu = torch.zeros(len(species), device=device, dtype=dtype)
+        self.nu[self.products_idx] = self.products_sto
+        self.nu[self.reactants_idx] -= self.reactants_sto
+
     # ---------- cinétique de base ----------
     def kf(self, T):
         """Facteur cinétique direct (Arrhenius)."""
@@ -85,6 +90,114 @@ class ElementaryReaction:
         Kc = self.Kc(T)
 
         return kf * (conc_react - (1.0 - self.oneWay) / Kc * conc_prod)
+
+
+    def omega(self, T, C):
+        """Production molaire ω_i pour chaque espèce (ncells, nspecies)."""
+        RR = self.RR(T, C)  # (ncells,)
+        return RR[:, None] * self.nu[None, :]   # (ncells, nspecies)
+
+
+    def jvp(self, T, C, vT, vC):
+        """
+        Jacobian-vector product analytique.
+        Args:
+            T   : (ncells,)
+            C   : (ncells, nspecies)
+            vT  : (ncells,)
+            vC  : (ncells, nspecies)
+        Returns:
+            Jv_RR : (ncells,)
+            Jv_omega : (ncells, nspecies)
+        """
+
+        RR = self.RR(T, C)
+        kf = self.kf(T)
+
+        # --------- dérivées pour les concentrations ---------
+        # réactifs :
+        C_react = C[:, self.reactants_idx]  # (ncells, n_react)
+        pow_react = self.reactants_sto
+        F = torch.prod(C_react**pow_react, dim=1)  # (ncells,)
+
+        # produits :
+        C_prod = C[:, self.products_idx]
+        pow_prod = self.products_sto
+        P = torch.prod(C_prod**pow_prod, dim=1)    # (ncells,)
+
+        Kc = self.Kc(T)
+        G = (1.0 - self.oneWay) * P / Kc
+
+        # dF/dC_j
+        dF_dC = torch.zeros_like(C)
+        for k, idx in enumerate(self.reactants_idx):
+            dF_dC[:, idx] = F * (pow_react[k] / C[:, idx])
+
+        # dG/dC_j
+        dG_dC = torch.zeros_like(C)
+        if not self.oneWay:
+            for k, idx in enumerate(self.products_idx):
+                dG_dC[:, idx] = G * (pow_prod[k] / C[:, idx])
+
+        # dérivées en C
+        dRR_dC = kf[:, None] * (dF_dC - dG_dC)   # (ncells, nspecies)
+
+        # ---------- dérivée en T ----------
+
+        # dkf/dT
+        dkf_dT = kf * (self.n / T + self.Ea / (R * T**2))
+
+        # dKc/dT : on utilise la définition log-diff
+        Kc_val = Kc
+        # dérivée log(Kc) = -(1/RT)*dG0/dT - delta_n/T  (approx)
+        # Pour rester robuste, utiliser autograd interne pour Kc(T)
+        T_req = T.detach().clone().requires_grad_()
+        Kc_auto = self.Kc(T_req)
+        dKc_dT = torch.autograd.grad(Kc_auto, T_req,
+                                     grad_outputs=torch.ones_like(T),
+                                     create_graph=False)[0]
+
+        dG_dT = (1.0 - self.oneWay) * (P * (-dKc_dT / (Kc_val**2)))
+
+        dRR_dT = dkf_dT * (F - G) + kf * (0 - dG_dT)
+
+        # ---------- Jv ----------
+        Jv_RR = dRR_dT * vT + torch.sum(dRR_dC * vC, dim=1)
+
+        # ω = RR * nu
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+
+        return Jv_RR, Jv_omega
+
+
+    # ---------- JVP via autograd ----------
+    def jvp_autograd(self, T, C, vT, vC):
+        T2 = T.detach().clone().requires_grad_(True)
+        C2 = C.detach().clone().requires_grad_(True)
+
+        RR = self.RR(T2, C2)
+
+        Jv = torch.autograd.grad(
+            RR,
+            (T2, C2),
+            grad_outputs=torch.ones_like(RR),
+            create_graph=False,
+            retain_graph=False
+        )
+
+        dRR_dT, dRR_dC = Jv
+        Jv_RR = dRR_dT * vT + torch.sum(dRR_dC * vC, dim=1)
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+        return Jv_RR, Jv_omega
+
+
+    # ---------- comparaison ----------
+    def compare_jvp(self, T, C, vT, vC):
+        Jv_ana = self.jvp(T, C, vT, vC)[0]
+        Jv_auto = self.jvp_autograd(T, C, vT, vC)[0]
+        err = torch.max(torch.abs(Jv_ana - Jv_auto))
+        print("Max error:", err.item())
+        return Jv_ana, Jv_auto, err
 
 
 class ElementaryReactionBatch:
@@ -531,6 +644,71 @@ class ThreeBodyReaction(ElementaryReaction):
         M = self.M_concentration(C)  # (ncells,)
         return baseRR * M
 
+    def jvp(self, T, C, vT, vC):
+        """
+        JVP analytique pour réaction tri-moléculaire.
+        Retourne (Jv_RR, Jv_omega)
+        """
+
+        # ----- RR_base et dérivées base -----
+        # On appelle la reaction parent pour obtenir les dérivée de RR_base
+        RR_base = ElementaryReaction.RR(self, T, C)
+        Jv_base_RR, _ = ElementaryReaction.jvp(self, T, C, vT, vC)
+
+        # ----- M et dérivée de M -----
+        M = self.M_concentration(C)  # (ncells,)
+        dM_dC = self.eff[None, :]    # (1, nspecies) broadcast
+
+        # ----- dérivée en T -----
+        # M ne dépend pas de T
+        dRR_dT = M * (Jv_base_RR / vT) if torch.any(vT != 0) else M * 0.0
+
+        # ----- dérivée en C -----
+        # dRR/dC = eff_j * RR_base + M * dRR_base/dC_j
+        # dRR_base/dC_j est obtenu via autograd local de ElementaryReaction :
+        C2 = C.detach().clone().requires_grad_(True)
+        RRb = ElementaryReaction.RR(self, T, C2)
+        grads = torch.autograd.grad(
+            RRb, C2,
+            grad_outputs=torch.ones_like(RRb),
+            retain_graph=False,
+            create_graph=False
+        )[0]  # (ncells, nspecies)
+        dRR_dC = dM_dC * RR_base[:, None] + M[:, None] * grads  # (ncells, nspecies)
+
+        # ----- JVP global -----
+        Jv_RR = dRR_dT * vT + torch.sum(dRR_dC * vC, dim=1)
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+
+        return Jv_RR, Jv_omega
+
+
+    # ---------- JVP via autograd ----------
+    def jvp_autograd(self, T, C, vT, vC):
+        T2 = T.detach().clone().requires_grad_(True)
+        C2 = C.detach().clone().requires_grad_(True)
+
+        RR = self.RR(T2, C2)
+
+        dRRdT, dRRdC = torch.autograd.grad(
+            RR, (T2, C2),
+            grad_outputs=torch.ones_like(RR),
+            retain_graph=False
+        )
+
+        Jv_RR = dRRdT * vT + torch.sum(dRRdC * vC, dim=1)
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+
+        return Jv_RR, Jv_omega
+
+
+    # ---------- comparaison ----------
+    def compare_jvp(self, T, C, vT, vC):
+        Jv_ana, _ = self.jvp(T, C, vT, vC)
+        Jv_auto, _ = self.jvp_autograd(T, C, vT, vC)
+        err = torch.max(torch.abs(Jv_ana - Jv_auto))
+        print("Max JVP error:", err.item())
+        return Jv_ana, Jv_auto, err
 
 
 
@@ -1734,7 +1912,7 @@ if __name__ == '__main__':
 
     yaml_file = "../tests/gri30.yaml"
     dtype = torch.float64
-    device = 'cuda'
+    device = 'cpu'
     y = yaml_thermo.yamlParser(yaml_file)
     vec_th = y.populateVectorizedThermoObject(dtype=dtype, device=device)
     reactions = parseReactions(yaml_file)
@@ -1751,20 +1929,29 @@ if __name__ == '__main__':
     # ============================================================
     # CONFIG
     # ============================================================
-    ncells = 100000  # nombre de cellules pour le test
+    ncells = 1000  # nombre de cellules pour le test
     model = FalloffReactionBatch(r_f, device=device, dtype=dtype)
     nspecies = len(model.species) # OU mettre une valeur si tu veux tester sans initialiser un vrai modèle
     torch.set_default_dtype(dtype)
 
 
+    T = torch.rand(ncells, device=device, dtype=dtype) * 1500 + 300
+    C = torch.rand(ncells, nspecies, device=device, dtype=dtype) * 1e-2 + 1e-8
+
+    v = torch.randn(ncells, nspecies+1, device=device, dtype=dtype)
+    for reac in r_e:
+        reac.compare_jvp(T, C, v[:,0], v[:,1:])
+
+    for reac in r_tb:
+        reac.compare_jvp(T, C, v[:,0], v[:,1:])
+
+
+    """
     # ============================================================
     # UTIL: fonction wrapper RR(T,C) → omega(T,C)
     # ============================================================
     def omega_fn(TC_flat):
-        """
-        TC_flat = concat(T, C) shape: (ncells + ncells*nspecies,)
-        Retourne w = omega(T,C) aplati.
-        """
+
         T = TC_flat[:ncells]  # (ncells,)
         C = TC_flat[ncells:].reshape(ncells, nspecies)  # (ncells, nspecies)
 
@@ -1829,3 +2016,4 @@ if __name__ == '__main__':
     print(f'\nAnalytic computation time: {t_anneliseitic:.6e} s')
     print(f'Autograd computation time {t_auto:.6e} s')
     print("===================================================\n")
+"""
