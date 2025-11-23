@@ -99,6 +99,7 @@ class ElementaryReaction:
 
 
     def jvp(self, T, C, vT, vC):
+        #TODO: faire une fonctino qui calucl omega et jvp d'un coup pour limiter au max les recalculs
         """
         Jacobian-vector product analytique.
         Args:
@@ -149,13 +150,35 @@ class ElementaryReaction:
 
         # dKc/dT : on utilise la définition log-diff
         Kc_val = Kc
-        # dérivée log(Kc) = -(1/RT)*dG0/dT - delta_n/T  (approx)
-        # Pour rester robuste, utiliser autograd interne pour Kc(T)
-        T_req = T.detach().clone().requires_grad_()
-        Kc_auto = self.Kc(T_req)
-        dKc_dT = torch.autograd.grad(Kc_auto, T_req,
-                                     grad_outputs=torch.ones_like(T),
-                                     create_graph=False)[0]
+        # ---------- dérivée analytique de Kc(T) ----------
+
+        # --- Récupérations thermo ---
+        h_r = self.thermo.h_species(T, self.reactants_idx)  # (ncells, n_react)
+        s_r = self.thermo.s_species_Pref(T, self.reactants_idx)
+        cp_r = self.thermo.cp_species(T, self.reactants_idx)
+
+        h_p = self.thermo.h_species(T, self.products_idx)  # (ncells, n_prod)
+        s_p = self.thermo.s_species_Pref(T, self.products_idx)
+        cp_p = self.thermo.cp_species(T, self.products_idx)
+
+        # --- ΔH°(T), ΔS°(T) ---
+        deltaH = torch.sum(self.products_sto * h_p, dim=1) - torch.sum(self.reactants_sto * h_r, dim=1)
+        deltaS = torch.sum(self.products_sto * s_p, dim=1) - torch.sum(self.reactants_sto * s_r, dim=1)
+
+        # --- dln(Kp)/dT = ΔH / (R T^2) ---
+        dlnKp_dT = deltaH / (R * T ** 2)
+
+        Kp_val = self.Kp(T)
+
+        # --- dKp/dT = Kp * dln(Kp)/dT ---
+        dKp_dT = Kp_val * dlnKp_dT
+
+        # --- Kc(T) ---
+        Kc_val = Kp_val * (Pref / (R * T)) ** self.delta_n
+
+        # --- dérivée analytique de Kc(T)
+        #     dKc/dT = Kc [ ΔH/(R T^2) - Δn/T ]
+        dKc_dT = Kc_val * (dlnKp_dT - self.delta_n / T)
 
         dG_dT = (1.0 - self.oneWay) * (P * (-dKc_dT / (Kc_val**2)))
 
@@ -646,42 +669,105 @@ class ThreeBodyReaction(ElementaryReaction):
 
     def jvp(self, T, C, vT, vC):
         """
-        JVP analytique pour réaction tri-moléculaire.
-        Retourne (Jv_RR, Jv_omega)
+        Jacobian-vector product pour une réaction three-body.
+
+        Utilise :
+            dRR3/dT   = [M] dRRe/dT
+            dRR3/dCi  = eff_i * RRe + [M] dRRe/dCi
         """
 
-        # ----- RR_base et dérivées base -----
-        # On appelle la reaction parent pour obtenir les dérivée de RR_base
-        RR_base = ElementaryReaction.RR(self, T, C)
-        Jv_base_RR, _ = ElementaryReaction.jvp(self, T, C, vT, vC)
+        # -------------------------
+        # 1) RR élémentaire + dérivées élémentaires
+        # -------------------------
+        # On appelle la jvp de la classe mère ElementaryReaction
+        # qui renvoie :
+        #   Jv_RRelem : (ncells,)
+        #   Jv_omega_elem : (ncells, nspecies)
+        #
+        # MAIS : on a aussi besoin dRR/dT et dRR/dC éléments !
+        # Donc on ré-appelle la partie analytique interne.
+        # Le plus simple et robuste : rappeler RR, dRRdT, dRRdC
+        # -------------------------
 
-        # ----- M et dérivée de M -----
+        RR_elem = ElementaryReaction.RR(self, T, C)  # (ncells,)
+
+        # On calcule les dérivées élémentaires avec le code de la classe mère :
+        # Pour ça, on va utiliser une version interne : on réutilise sa jvp avec base e_j.
+        # Mieux : on refactorise le calcul interne dans la classe mère.
+        # Pour éviter toute modification : je recalcule ici directement
+        # EXACTEMENT comme ElementaryReaction.jvp, mais sans faire Jv :
+
+        # ----- Rappels intermédiaires élémentaires -----
+        kf = self.kf(T)
+
+        C_react = C[:, self.reactants_idx]
+        C_prod = C[:, self.products_idx]
+        pow_react = self.reactants_sto
+        pow_prod = self.products_sto
+
+        F = torch.prod(C_react ** pow_react, dim=1)
+        P = torch.prod(C_prod ** pow_prod, dim=1)
+
+        Kc = self.Kc(T)
+
+        # dF/dC
+        dF_dC = torch.zeros_like(C)
+        for k, idx in enumerate(self.reactants_idx):
+            dF_dC[:, idx] = F * (pow_react[k] / C[:, idx])
+
+        # dG/dC
+        G = (1.0 - self.oneWay) * P / Kc
+        dG_dC = torch.zeros_like(C)
+        if not self.oneWay:
+            for k, idx in enumerate(self.products_idx):
+                dG_dC[:, idx] = G * (pow_prod[k] / C[:, idx])
+
+        # dRR_elem/dC
+        dRRdC_elem = kf[:, None] * (dF_dC - dG_dC)  # (ncells, nspecies)
+
+        # dRR_elem/dT analytique déjà implémenté dans ElementaryReaction.jvp :
+        # On recalcule : (dkf/dT)(F-G) + kf( - dG/dT )
+        dkf_dT = kf * (self.n / T + self.Ea / (R * T ** 2))
+
+        # dérivée analytique de Kc :
+        h_r = self.thermo.h_species(T, self.reactants_idx)
+        s_r = self.thermo.s_species_Pref(T, self.reactants_idx)
+        h_p = self.thermo.h_species(T, self.products_idx)
+        s_p = self.thermo.s_species_Pref(T, self.products_idx)
+
+        deltaH = torch.sum(self.products_sto * h_p, dim=1) - torch.sum(self.reactants_sto * h_r, dim=1)
+        dlnKp_dT = deltaH / (R * T ** 2)
+        Kp_val = self.Kp(T)
+        Kc_val = Kp_val * (Pref / (R * T)) ** self.delta_n
+        dKc_dT = Kc_val * (dlnKp_dT - self.delta_n / T)
+
+        dG_dT = (1.0 - self.oneWay) * (P * (-dKc_dT / (Kc_val ** 2)))
+        dRRdT_elem = dkf_dT * (F - G) + kf * (0 - dG_dT)  # (ncells,)
+
+        # -------------------------
+        # 2) Termes Three-body : [M] et dérivées de M
+        # -------------------------
         M = self.M_concentration(C)  # (ncells,)
-        dM_dC = self.eff[None, :]    # (1, nspecies) broadcast
+        dMdC = self.eff[None, :]  # (1, nspecies)
 
-        # ----- dérivée en T -----
-        # M ne dépend pas de T
-        dRR_dT = M * (Jv_base_RR / vT) if torch.any(vT != 0) else M * 0.0
+        # -------------------------
+        # 3) Dérivées tri-moléculaires
+        # -------------------------
+        # dRR3/dT = [M] dRRe/dT
+        dRRdT_3 = M * dRRdT_elem
 
-        # ----- dérivée en C -----
-        # dRR/dC = eff_j * RR_base + M * dRR_base/dC_j
-        # dRR_base/dC_j est obtenu via autograd local de ElementaryReaction :
-        C2 = C.detach().clone().requires_grad_(True)
-        RRb = ElementaryReaction.RR(self, T, C2)
-        grads = torch.autograd.grad(
-            RRb, C2,
-            grad_outputs=torch.ones_like(RRb),
-            retain_graph=False,
-            create_graph=False
-        )[0]  # (ncells, nspecies)
-        dRR_dC = dM_dC * RR_base[:, None] + M[:, None] * grads  # (ncells, nspecies)
+        # dRR3/dC_i = eff_i * RR_elem + [M] dRRe/dC_i
+        dRRdC_3 = RR_elem[:, None] * dMdC + M[:, None] * dRRdC_elem  # (ncells, nspecies)
 
-        # ----- JVP global -----
-        Jv_RR = dRR_dT * vT + torch.sum(dRR_dC * vC, dim=1)
+        # -------------------------
+        # 4) Jacobian-vector product
+        # -------------------------
+        Jv_RR = dRRdT_3 * vT + torch.sum(dRRdC_3 * vC, dim=1)
+
+        # ω_i = RR * ν_i
         Jv_omega = Jv_RR[:, None] * self.nu[None, :]
 
         return Jv_RR, Jv_omega
-
 
     # ---------- JVP via autograd ----------
     def jvp_autograd(self, T, C, vT, vC):
@@ -1233,6 +1319,285 @@ class FalloffReaction(ElementaryReaction):
         RR = kf_vec * (conc_react - (1.0 - self.oneWay) / Kc * conc_prod)
         return RR
 
+    def omega(self, T, C):
+        """
+        Compute species production rates omega: (ncells, nspecies)
+        """
+        RR = self.RR(T, C)  # (ncells,)
+        return RR[:, None] * self.nu[None, :]  # broadcast
+
+    def jvp(self, T, C, vT, vC):
+        """
+        Jacobian-vector product analytique pour Falloff (Lindemann/Troe).
+        Return:
+            Jv_RR:   (ncells,)
+            Jv_omega:(ncells, nspecies)
+        """
+        # shapes
+        ncells = T.shape[0]
+        nspecies = C.shape[1]
+        dtype = T.dtype
+        device = T.device
+        eps = self.eps
+        # ----------------------------
+        # 1) Quantities used by mass-action part (F_massaction and G)
+        # ----------------------------
+        # reactant/product concentration products
+        C_react = C[:, self.reactants_idx]  # (ncells, n_react)
+        C_prod = C[:, self.products_idx]  # (ncells, n_prod)
+        pow_react = self.reactants_sto  # (n_react,)
+        pow_prod = self.products_sto  # (n_prod,)
+
+        F_mass = torch.prod(C_react ** pow_react, dim=1)  # (ncells,)
+        P_prod = torch.prod(C_prod ** pow_prod, dim=1)  # (ncells,)
+
+        # Kc and G
+        Kc_val = self.Kc(T)  # (ncells,)
+        # clamp Kc to avoid divisions by zero (but keep shape)
+        Kc_safe = Kc_val
+        G = (1.0 - self.oneWay) * P_prod / Kc_safe  # (ncells,)
+
+        # derivatives of F_mass wrt C
+        dF_dC = torch.zeros_like(C)  # (ncells, nspecies)
+        for k, idx in enumerate(self.reactants_idx):
+            # pow_react[k] / C[:, idx]
+            dF_dC[:, idx] = F_mass * (pow_react[k] / torch.clamp(C[:, idx], min=eps))
+
+        # derivatives of P_prod wrt C (for G d/dC)
+        dP_dC = torch.zeros_like(C)
+        for k, idx in enumerate(self.products_idx):
+            dP_dC[:, idx] = P_prod * (pow_prod[k] / torch.clamp(C[:, idx], min=eps))
+
+        # dG/dC = (1-oneWay) * dP_dC / Kc (Kc independent of C)
+        dG_dC = (1.0 - self.oneWay) * (dP_dC / Kc_safe[:, None])
+
+        # ----------------------------
+        # 2) k_falloff (kf) and its derivatives
+        #    k0(T), kinf(T), M(C), Pr, k_base, F_falloff(T,Pr)
+        # ----------------------------
+        # base Arrhenius low/high
+        k0 = self._k0_T(T)  # (ncells,)
+        kinf = self._kinf_T(T)  # (ncells,)
+
+        # M and its derivatives
+        M = self.M_concentration(C)  # (ncells,)
+        dM_dC = self.eff[None, :]  # (1, nspecies) -> broadcasted
+        # dM/dT = 0
+
+        # Pr and safe clamp
+        kinf_safe = kinf
+        Pr = (k0 * M) / kinf_safe
+        Pr = Pr  # ensure positive for log10
+
+        # k_base = kinf * Pr / (1+Pr) = kinf * ratio
+        ratio = Pr / (1.0 + Pr)
+        k_base = kinf * ratio
+
+        # Falloff factor F (Lindemann/Troe)
+        F_fall = self._F(T, Pr)  # (ncells,)
+
+        # total forward kf
+        kf = k_base * F_fall  # (ncells,)
+
+        # ---- derivatives of k0 and kinf wrt T (analytical) ----
+        dk0_dT = k0 * (self.b_k0 / T + self.Ea_k0 / (R * T ** 2))
+        dkinf_dT = kinf * (self.b_kinf / T + self.Ea_kinf / (R * T ** 2))
+
+        # ---- derivatives of Pr ----
+        # dPr/dT = (dk0/dT * M)/kinf - (k0*M/kinf^2)*dkinf/dT
+        dPr_dT = (dk0_dT * M) / kinf_safe - (k0 * M / (kinf_safe ** 2)) * dkinf_dT
+        # dPr/dC_j = (k0/kinf) * eff_j
+        dPr_dC = (k0 / kinf_safe)[:, None] * dM_dC  # (ncells, nspecies)
+
+        # ---- derivatives of k_base ----
+        # dratio/dPr = 1/(1+Pr)^2
+        dratio_dPr = 1.0 / (1.0 + Pr) ** 2
+        dk_base_dT = dkinf_dT * ratio + kinf * dratio_dPr * dPr_dT  # (ncells,)
+        dk_base_dC = kinf[:, None] * dratio_dPr[:, None] * dPr_dC  # (ncells, nspecies)
+
+        # ----------------------------
+        # 3) Analytic Troe derivatives dF/dT and dF/dPr
+        #    (for Lindemann, dF=0)
+        # ----------------------------
+        if self.falloffType == 'lindemann':
+            dF_dT = torch.zeros_like(T)
+            dF_dPr = torch.zeros((ncells,), dtype=dtype, device=device)
+        else:
+            # Troe params
+            params = self.falloffParams or {}
+            A = float(params.get('A', 0.0))
+            T1 = float(params.get('T1', 0.0))
+            T2 = float(params.get('T2', 0.0))
+            T3 = float(params.get('T3', 0.0))
+
+            # compute Fcent and dFcent/dT analytically
+            # contributions
+            term1 = torch.zeros_like(T)
+            dterm1_dT = torch.zeros_like(T)
+            if T3 > 0.0:
+                term1 = term1 + ((1.0 - A) * torch.exp(-T / T3))
+                dterm1_dT = dterm1_dT + ((1.0 - A) * (-1.0 / T3) * torch.exp(-T / T3))
+
+            term2 = torch.zeros_like(T)
+            dterm2_dT = torch.zeros_like(T)
+            if T1 > 0.0:
+                term2 = term2 + (A * torch.exp(-T / T1))
+                dterm2_dT = dterm2_dT + (A * (-1.0 / T1) * torch.exp(-T / T1))
+
+            term3 = torch.zeros_like(T)
+            dterm3_dT = torch.zeros_like(T)
+            if T2 > 0.0:
+                term3 = term3 + torch.exp(-T2 / T)
+                # derivative of exp(-T2/T) wrt T: exp(-T2/T) * (T2/T^2)
+                dterm3_dT = dterm3_dT + ((T2 / (T ** 2)) * torch.exp(-T2 / T))
+
+            Fcent = term1 + term2 + term3
+            # clamp
+            Fcent_safe = Fcent
+
+            # log10(Fcent)
+            ln10 = torch.log(torch.tensor(10.0, dtype=dtype, device=device))
+            logFcent = torch.log10(Fcent_safe)  # (ncells,)
+            # d log10(Fcent)/dT = (1/(Fcent ln10)) * dFcent/dT
+            dFcent_dT = dterm1_dT + dterm2_dT + dterm3_dT
+            dlogFcent_dT = dFcent_dT / (Fcent_safe * ln10)  # (ncells,)
+
+            # C and N and their derivatives
+            Cparam = -0.4 - 0.67 * logFcent
+            Nparam = 0.75 - 1.27 * logFcent
+            dC_dT = -0.67 * dlogFcent_dT
+            dN_dT = -1.27 * dlogFcent_dT
+
+            # log10 Pr and derivative wrt T and Pr
+            # Pr is already clamped > eps
+            logPr = torch.log10(Pr)
+            # d log10(Pr)/dT = (1/(Pr ln10)) * dPr_dT
+            dlogPr_dT = (1.0 / (Pr * ln10)) * dPr_dT
+            # d log10(Pr)/dPr = 1/(Pr ln10)
+            dlogPr_dPr = 1.0 / (Pr * ln10)
+
+            # S = logPr + C
+            S = logPr + Cparam
+            dS_dT = dlogPr_dT + dC_dT
+            # dS/dPr = dlogPr/dPr (C independent of Pr)
+            dS_dPr = dlogPr_dPr
+
+            # D = N - 0.14 * S
+            D = Nparam - 0.14 * S
+            dD_dT = dN_dT - 0.14 * dS_dT
+            dD_dPr = -0.14 * dS_dPr
+
+            # f1 = S / D
+            # df1/dT = (dS*D - S*dD) / D^2
+            denom = D * D
+            # avoid zero denom
+            denom_safe = denom
+            df1_dT = (dS_dT * D - S * dD_dT) / denom_safe
+            # df1/dPr = (dS/dPr * D - S * dD/dPr) / D^2
+            df1_dPr = (dS_dPr * D - S * dD_dPr) / denom_safe
+
+            f1 = S / D
+            f1_sq = f1 * f1
+
+            # exponent e = logFcent / (1 + f1^2)
+            denom2 = (1.0 + f1_sq)
+            denom2_safe = denom2
+            e_exp = logFcent / denom2_safe
+
+            # de/dT = (dlogFcent/dT * denom2 - logFcent * 2 f1 df1/dT) / denom2^2
+            de_dT = (dlogFcent_dT * denom2_safe - logFcent * (2.0 * f1 * df1_dT)) / (denom2_safe * denom2_safe)
+
+            # de/dPr = (0 * denom2 - logFcent * 2 f1 df1/dPr) / denom2^2
+            # (logFcent does not depend on Pr)
+            de_dPr = (- logFcent * (2.0 * f1 * df1_dPr)) / (denom2_safe * denom2_safe)
+
+            # F = 10^e  => dF/de = ln(10) * F
+            F_fall_safe = F_fall
+            dF_dT = ln10 * F_fall_safe * de_dT  # (ncells,)
+            dF_dPr = ln10 * F_fall_safe * de_dPr  # (ncells,)
+
+        # dF_dC via chain rule: dF/dC_j = dF/dPr * dPr/dC_j
+        dF_dC = dF_dPr[:, None] * dPr_dC  # (ncells, nspecies)
+
+        # ---- dkf derivatives ----
+        # dkf_dT = dk_base_dT * F + k_base * dF_dT
+        dkf_dT = dk_base_dT * F_fall + k_base * dF_dT  # (ncells,)
+        # dkf_dC = dk_base_dC * F + k_base[:,None] * dF_dC
+        dkf_dC = dk_base_dC * F_fall[:, None] + k_base[:, None] * dF_dC  # (ncells, nspecies)
+
+        # ----------------------------
+        # 4) dG/dT (Kc depends on T only) and dG/dC (depends on dP_dC)
+        #    dKc/dT analytic via thermo (using deltaH)
+        # ----------------------------
+        # compute deltaH using thermo (vectorized)
+        h_r = self.thermo.h_species(T, self.reactants_idx)  # (ncells, n_react)
+        s_r = self.thermo.s_species_Pref(T, self.reactants_idx)
+        h_p = self.thermo.h_species(T, self.products_idx)  # (ncells, n_prod)
+        s_p = self.thermo.s_species_Pref(T, self.products_idx)
+
+        deltaH = torch.sum(self.products_sto * h_p, dim=1) - torch.sum(self.reactants_sto * h_r, dim=1)  # (ncells,)
+        # d ln Kp / dT = deltaH / (R T^2)
+        dlnKp_dT = deltaH / (R * T ** 2)
+        # Kp and Kc
+        Kp_val = self.Kp(T)
+        Kc_val = Kc_val  # already computed
+        # dKc/dT = Kc * (dlnKp/dT - delta_n / T)
+        dKc_dT = Kc_val * (dlnKp_dT - self.delta_n / T)
+
+        # dG/dT = (1-oneWay) * ( P_prod * ( - dKc_dT / Kc^2 ) )
+        dG_dT = (1.0 - self.oneWay) * (P_prod * (- dKc_dT / (Kc_safe ** 2)))
+
+        # dG/dC already: dG_dC = (1-oneWay) * dP_dC / Kc_safe[:,None]
+
+        # ----------------------------
+        # 5) dRR/dT and dRR/dC
+        # RR = kf * (F_mass - G)
+        # ----------------------------
+        FmG = F_mass - G  # (ncells,)
+
+        # dRR/dT = dkf_dT * (F_mass - G) + kf * (0 - dG/dT)
+        dRR_dT = dkf_dT * FmG + kf * (- dG_dT)
+
+        # dRR/dC_j = dkf_dC_j * (F_mass - G) + kf * (dF_dC_j - dG_dC_j)
+        # where dF_dC_j = dF_mass/dC_j (reactants)  (we computed dF_dC for that)
+        dFmass_dC = dF_dC  # (ncells, nspecies) for reactants, zero elsewhere already set
+        dRR_dC = dkf_dC * FmG[:, None] + kf[:, None] * (dFmass_dC - dG_dC)
+
+        # ----------------------------
+        # 6) Jv contraction
+        # ----------------------------
+        Jv_RR = dRR_dT * vT + torch.sum(dRR_dC * vC, dim=1)
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+
+        return Jv_RR, Jv_omega
+
+
+    # ---------- JVP via autograd ----------
+    def jvp_autograd(self, T, C, vT, vC):
+        T2 = T.detach().clone().requires_grad_(True)
+        C2 = C.detach().clone().requires_grad_(True)
+
+        RR = self.RR(T2, C2)
+
+        dRRdT, dRRdC = torch.autograd.grad(
+            RR, (T2, C2),
+            grad_outputs=torch.ones_like(RR),
+            retain_graph=False
+        )
+
+        Jv_RR = dRRdT * vT + torch.sum(dRRdC * vC, dim=1)
+        Jv_omega = Jv_RR[:, None] * self.nu[None, :]
+
+        return Jv_RR, Jv_omega
+
+
+    # ---------- comparaison ----------
+    def compare_jvp(self, T, C, vT, vC):
+        Jv_ana, _ = self.jvp(T, C, vT, vC)
+        Jv_auto, _ = self.jvp_autograd(T, C, vT, vC)
+        err = torch.max(torch.abs(Jv_ana - Jv_auto))
+        print("Max JVP error:", err.item())
+        return Jv_ana, Jv_auto, err
 
 class FalloffReactionBatch:
     """
@@ -1582,14 +1947,18 @@ class FalloffReactionBatch:
 
         return w
 
-    def jvp(self, T, C, v_T, v_C): #TODO: investigate the error occuring compared to autograd for only few samples
+    def jvp(self, T, C, v_T, v_C):
         """
         Jacobian-vector product for species production rates w.r.t perturbations (v_T, v_C)
         for falloff (Lindemann + Troe) reaction batch.
 
-        Signature matches ThreeBody/Elementary implementations.
+        CORRECTIONS v2:
+        - Fix majeur: la dérivée de kf par rapport à C doit passer par DEUX chemins
+          1. k_base dépend de Pr qui dépend de M(C)
+          2. F dépend de Pr qui dépend de M(C)
+        - Meilleure gestion des cas limites numériques
         """
-        #print('WARNING, NO PHYSICAL VALIDATION OF THIS CLASS')
+        import math
         ncells = T.shape[0]
         device = self.device
         dtype = self.dtype
@@ -1622,9 +1991,11 @@ class FalloffReactionBatch:
         k0 = self._k0_T(T)
         kinf = self._kinf_T(T)
         T_exp = T[:, None]
+
         # dk0/dT = k0 * (b_k0/T + Ea_k0/(R*T^2))
         dk0_dT = k0 * (self.b_k0[None, :] / T_exp + self.Ea_k0[None, :] / (R * T_exp * T_exp))
         dkinf_dT = kinf * (self.b_kinf[None, :] / T_exp + self.Ea_kinf[None, :] / (R * T_exp * T_exp))
+
         kinf_mask = kinf > self.eps
         dkinf_dT = torch.where(kinf_mask, dkinf_dT, torch.zeros_like(dkinf_dT))
 
@@ -1632,26 +2003,32 @@ class FalloffReactionBatch:
         M = self.M_concentration(C)  # (ncells, n_reactions)
         dM_from_C_v = torch.matmul(v_C, self.eff_matrix.t())  # (ncells, n_reactions)
 
-        # Pr and safe
+        # Pr and safe versions
         kinf_safe = torch.clamp(kinf, min=self.eps)
         Pr = (k0 * M) / kinf_safe
-        pr_mask = Pr > self.eps
+        pr_mask = (Pr > self.eps) & (M > self.eps)
         Pr_safe = torch.clamp(Pr, min=self.eps)
 
-        # derivatives of Pr
-        # dPr/dT = (dk0/dT * M - k0 * dkinf/dT * M / kinf_safe) / kinf_safe
-        # using quotient rules carefully
-        dPr_dT = (dk0_dT * M - k0 * (dkinf_dT) * M / kinf_safe) / kinf_safe
+        # Derivatives of Pr
+        # dPr/dT = d/dT(k0 * M / kinf)
+        # Using quotient rule: d(u/v) = (u'v - uv')/v^2 where u = k0*M, v = kinf
+        # Since M doesn't depend on T: u' = dk0/dT * M
+        dPr_dT = (dk0_dT * M - k0 * M * dkinf_dT / kinf_safe) / kinf_safe
         dPr_dT = torch.where(pr_mask, dPr_dT, torch.zeros_like(dPr_dT))
+
         # dPr/dC · v = (k0/kinf) * dM/dC · v
-        k0_over_kinf = k0 / kinf_safe
-        dPr_from_C_v = k0_over_kinf * dM_from_C_v
+        dPr_dM = k0 / kinf_safe  # coefficient de M dans Pr
+        dPr_from_C_v = dPr_dM * dM_from_C_v
         dPr_from_C_v = torch.where(pr_mask, dPr_from_C_v, torch.zeros_like(dPr_from_C_v))
 
         # --- Falloff factor F and its derivatives ---
-        # Build F like in _F_matrix but keep intermediate quantities for derivatives
+        # F depends on (T, Pr), so dF/dT has two components:
+        # 1. Direct dependence on T (via Fcent)
+        # 2. Indirect via Pr (already computed as dF/dPr)
+
         nc = ncells
         T_exp_col = T[:, None]
+
         # troe parameters expanded
         A = self.troe_A[None, :].expand(nc, -1)
         T1 = self.troe_T1[None, :].expand(nc, -1)
@@ -1659,23 +2036,25 @@ class FalloffReactionBatch:
         T3 = self.troe_T3[None, :].expand(nc, -1)
 
         # Compute Fcent components and derivative wrt T
-        # masks
-        mask_T1 = T1 > 0.0
-        mask_T3 = T3 > 0.0
-        mask_T2 = T2 > 0.0
+        mask_T1 = T1 > self.eps
+        mask_T3 = T3 > self.eps
+        mask_T2 = T2 > self.eps
 
-        # components
+        # components - using safe division
+        T1_safe = torch.where(mask_T1, T1, torch.ones_like(T1))
+        T3_safe = torch.where(mask_T3, T3, torch.ones_like(T3))
+        T2_safe = torch.where(mask_T2, T2, torch.ones_like(T2))
+
         comp1 = torch.zeros_like(Pr, dtype=dtype, device=device)
         comp2 = torch.zeros_like(Pr, dtype=dtype, device=device)
         comp3 = torch.zeros_like(Pr, dtype=dtype, device=device)
 
         if mask_T1.any():
-            comp1 = (A * torch.exp(-T_exp_col / torch.where(mask_T1, T1, torch.ones_like(T1)))) * mask_T1.to(dtype)
+            comp1 = (A * torch.exp(-T_exp_col / T1_safe)) * mask_T1.to(dtype)
         if mask_T3.any():
-            comp2 = ((1.0 - A) * torch.exp(-T_exp_col / torch.where(mask_T3, T3, torch.ones_like(T3)))) * mask_T3.to(
-                dtype)
+            comp2 = ((1.0 - A) * torch.exp(-T_exp_col / T3_safe)) * mask_T3.to(dtype)
         if mask_T2.any():
-            comp3 = (torch.exp(-torch.where(mask_T2, T2, torch.ones_like(T2)) / T_exp_col)) * mask_T2.to(dtype)
+            comp3 = (torch.exp(-T2_safe / T_exp_col)) * mask_T2.to(dtype)
 
         Fcent = comp1 + comp2 + comp3
         Fcent = torch.clamp(Fcent, min=self.eps)
@@ -1686,108 +2065,130 @@ class FalloffReactionBatch:
         dcomp3_dT = torch.zeros_like(comp3)
 
         if mask_T1.any():
-            # d/dT [A * exp(-T/T1)] = A * (-1/T1) * exp(-T/T1)
-            dcomp1_dT = (A * (-1.0 / torch.where(mask_T1, T1, torch.ones_like(T1))) *
-                         torch.exp(-T_exp_col / torch.where(mask_T1, T1, torch.ones_like(T1)))) * mask_T1.to(dtype)
+            dcomp1_dT = (A * (-1.0 / T1_safe) * torch.exp(-T_exp_col / T1_safe)) * mask_T1.to(dtype)
         if mask_T3.any():
-            dcomp2_dT = ((1.0 - A) * (-1.0 / torch.where(mask_T3, T3, torch.ones_like(T3))) *
-                         torch.exp(-T_exp_col / torch.where(mask_T3, T3, torch.ones_like(T3)))) * mask_T3.to(dtype)
+            dcomp2_dT = ((1.0 - A) * (-1.0 / T3_safe) * torch.exp(-T_exp_col / T3_safe)) * mask_T3.to(dtype)
         if mask_T2.any():
-            # d/dT [exp(-T2/T)] = exp(-T2/T) * (T2 / T^2)
-            dcomp3_dT = (torch.exp(-torch.where(mask_T2, T2, torch.ones_like(T2)) / T_exp_col) *
-                         (torch.where(mask_T2, T2, torch.ones_like(T2)) / (T_exp_col * T_exp_col))) * mask_T2.to(dtype)
+            dcomp3_dT = (torch.exp(-T2_safe / T_exp_col) * (T2_safe / (T_exp_col * T_exp_col))) * mask_T2.to(dtype)
 
         dFcent_dT = dcomp1_dT + dcomp2_dT + dcomp3_dT
 
-        # log10(Fcent) and derivative
-        logFcent = torch.log10(Fcent)
-        # d(log10 Fcent)/dT = (1 / (Fcent * ln(10))) * dFcent/dT
+        # Derivative of log10(Fcent)
         inv_ln10 = 1.0 / math.log(10.0)
         fcent_mask = Fcent > self.eps
-        dlogFcent_dT = (dFcent_dT / Fcent) * inv_ln10
-        dFcent_dT = torch.where(fcent_mask, dFcent_dT, torch.zeros_like(dFcent_dT))
+        dlogFcent_dT = torch.where(fcent_mask, (dFcent_dT / Fcent) * inv_ln10, torch.zeros_like(dFcent_dT))
 
+        logFcent = torch.log10(torch.clamp(Fcent, min=self.eps))
         C_par = -0.4 - 0.67 * logFcent
         N_par = 0.75 - 1.27 * logFcent
+
+        # Derivatives of C_par and N_par w.r.t T
         dCpar_dT = -0.67 * dlogFcent_dT
         dNpar_dT = -1.27 * dlogFcent_dT
 
-        # guard Pr for log10
+        # logPr and its derivative w.r.t Pr
         logPr = torch.log10(Pr_safe)
         dlogPr_dPr = torch.where(pr_mask, 1.0 / (Pr_safe * math.log(10.0)), torch.zeros_like(Pr_safe))
 
-
-
-        # f1 numerator/denominator
+        # f1 calculation
         numerator = (logPr + C_par)
         denominator = (N_par - 0.14 * (logPr + C_par))
-        denominator = torch.where(denominator == 0.0, torch.full_like(denominator, self.eps), denominator)
-        f1 = numerator / denominator
+
+        # Protect denominator with appropriate sign preservation
+        denom_abs = torch.abs(denominator)
+        denom_sign = torch.sign(denominator)
+        denom_sign = torch.where(denom_sign == 0.0, torch.ones_like(denom_sign), denom_sign)
+        denom_safe = torch.where(denom_abs < self.eps, denom_sign * self.eps, denominator)
+
+        f1 = numerator / denom_safe
         f1_sq = f1 * f1
 
-        # derivatives of f1 w.r.t Pr and T
-        # df1/dPr = (dlogPr_dPr * denominator - numerator * (-0.14 * dlogPr_dPr)) / denominator^2
-        denom_sq = denominator * denominator
-        df1_dPr = (dlogPr_dPr * denominator + 0.14 * numerator * dlogPr_dPr) / denom_sq
-        denom_mask = (denominator != 0.0)
-        df1_dPr = torch.where(denom_mask, df1_dPr, torch.zeros_like(df1_dPr))
+        # Derivatives of f1
+        denom_sq = denom_safe * denom_safe
+        denom_mask = (denom_abs > self.eps)
 
-        # df1/dT: numerator_T = dCpar_dT, denominator_T = dNpar_dT - 0.14 * dCpar_dT
-        numerator_T = dCpar_dT
-        denominator_T = dNpar_dT - 0.14 * dCpar_dT
-        df1_dT = (numerator_T * denominator - numerator * denominator_T) / denom_sq
+        # df1/dPr using quotient rule
+        # numerator = logPr + C_par (C_par doesn't depend on Pr)
+        # denominator = N_par - 0.14*(logPr + C_par) (N_par doesn't depend on Pr)
+        # dnumerator/dPr = dlogPr/dPr
+        # ddenominator/dPr = -0.14 * dlogPr/dPr
+        df1_dPr = (dlogPr_dPr * denom_safe + 0.14 * numerator * dlogPr_dPr) / denom_sq
+        df1_dPr = torch.where(denom_mask & pr_mask, df1_dPr, torch.zeros_like(df1_dPr))
+
+        # df1/dT (Pr is held constant, only T varies via C_par and N_par)
+        numerator_T = dCpar_dT  # d(numerator)/dT
+        denominator_T = dNpar_dT - 0.14 * dCpar_dT  # d(denominator)/dT
+        df1_dT = (numerator_T * denom_safe - numerator * denominator_T) / denom_sq
         df1_dT = torch.where(denom_mask, df1_dT, torch.zeros_like(df1_dT))
 
-        # exponent = logFcent / (1 + f1^2)
+        # Exponent = logFcent / (1 + f1^2)
         denom_f = (1.0 + f1_sq)
         denom_f_sq = denom_f * denom_f
+        exponent = logFcent / denom_f
 
+        # Derivatives of exponent
+        # dexponent/dlogFcent = 1 / (1 + f1^2)
+        # dexponent/df1 = -2*f1*logFcent / (1 + f1^2)^2
         dexponent_dlogFcent = 1.0 / denom_f
         dexponent_df1 = -2.0 * f1 * logFcent / denom_f_sq
 
-        # d exponent / dT = dexponent_dlogFcent * dlogFcent_dT + dexponent_df1 * df1_dT
-        dexponent_dT = dexponent_dlogFcent * dlogFcent_dT + dexponent_df1 * df1_dT
+        # Total derivative d(exponent)/dT with Pr constant
+        # exponent depends on T via logFcent and f1
+        dexponent_dT_direct = dexponent_dlogFcent * dlogFcent_dT + dexponent_df1 * df1_dT
 
-        # d exponent / dPr = dexponent_df1 * df1_dPr  (logFcent independent of Pr)
+        # Derivative d(exponent)/dPr with T constant
         dexponent_dPr = dexponent_df1 * df1_dPr
 
-        # F = 10^exponent -> dF = F * ln(10) * d exponent
-        F_troe = torch.pow(10.0, logFcent / denom_f)
+        # F = 10^exponent
+        F_troe = torch.pow(10.0, exponent)
         ln10 = math.log(10.0)
-        dF_dT = F_troe * ln10 * dexponent_dT
+
+        # dF/dT at constant Pr (direct T dependence)
+        dF_dT_direct = F_troe * ln10 * dexponent_dT_direct
+
+        # dF/dPr at constant T
         dF_dPr = F_troe * ln10 * dexponent_dPr
 
-        # Build full F matrix
+        # Build full F matrix and derivative matrices
         F = torch.ones((nc, self.n_reactions), dtype=dtype, device=device)
+        dF_dT_direct_full = torch.zeros_like(F)
+        dF_dPr_full = torch.zeros_like(F)
+
         troe_idx = [i for i, t in enumerate(self.falloff_types) if t == 'troe']
         if len(troe_idx) > 0:
             mask = torch.zeros((self.n_reactions,), dtype=torch.bool, device=device)
             mask[torch.tensor(troe_idx, device=device, dtype=torch.long)] = True
             F[:, mask] = F_troe[:, mask]
-            # Only keep derivatives for troe reactions, others remain zero
-            dF_dT = dF_dT * mask[None, :]
-            dF_dPr = dF_dPr * mask[None, :]
-        else:
-            # no troe reactions
-            dF_dT = torch.zeros_like(F)
-            dF_dPr = torch.zeros_like(F)
+            dF_dT_direct_full[:, mask] = dF_dT_direct[:, mask]
+            dF_dPr_full[:, mask] = dF_dPr[:, mask]
 
-        # For Lindemann, F = 1 -> derivatives zero
+        # --- k_base = kinf * Pr/(1+Pr) and its derivatives ---
+        Pr_term = Pr / (1.0 + Pr)
+        k_base = kinf_safe * Pr_term
 
-        # --- derivatives of k_base = kinf * Pr/(1+Pr) ---
-        # f(Pr) = Pr/(1+Pr), f'(Pr) = 1/(1+Pr)^2
-        f_prime = 1.0 / ((1.0 + Pr) * (1.0 + Pr))
+        # dk_base/dT = dkinf/dT * Pr/(1+Pr) + kinf * d[Pr/(1+Pr)]/dT
+        # d[Pr/(1+Pr)]/dPr = 1/(1+Pr)^2
+        dPr_term_dPr = 1.0 / ((1.0 + Pr) * (1.0 + Pr))
 
-        dkbase_dT = dkinf_dT * (Pr / (1.0 + Pr)) + kinf_safe * (f_prime * dPr_dT)
-        # dkbase/dC · v = kinf * f'(Pr) * dPr_from_C_v
-        dkbase_from_C_v = kinf_safe * (f_prime * dPr_from_C_v)
+        dkbase_dT = dkinf_dT * Pr_term + kinf_safe * dPr_term_dPr * dPr_dT
 
-        # kf = k_base * F
-        k_base = kinf_safe * (Pr / (1.0 + Pr))
-        dkf_dT = dkbase_dT * F + k_base * dF_dT
-        dkf_from_C_v = dkbase_from_C_v * F + k_base * (dF_dPr * dPr_from_C_v)
+        # dk_base/dC · v = kinf * d[Pr/(1+Pr)]/dPr * dPr/dC · v
+        dkbase_from_C_v = kinf_safe * dPr_term_dPr * dPr_from_C_v
 
-        # --- dKc/dT analytic (reuse pattern from Elementary) ---
+        # --- kf = k_base * F ---
+        # Total derivative w.r.t T:
+        # dkf/dT = dk_base/dT * F + k_base * dF/dT_total
+        # where dF/dT_total = dF/dT_direct + dF/dPr * dPr/dT
+        dF_dT_total = dF_dT_direct_full + dF_dPr_full * dPr_dT
+        dkf_dT = dkbase_dT * F + k_base * dF_dT_total
+
+        # Total derivative w.r.t C:
+        # dkf/dC · v = dk_base/dC · v * F + k_base * dF/dC · v
+        # where dF/dC · v = dF/dPr * dPr/dC · v
+        dF_from_C_v = dF_dPr_full * dPr_from_C_v
+        dkf_from_C_v = dkbase_from_C_v * F + k_base * dF_from_C_v
+
+        # --- dKc/dT analytic ---
         h_r = self.thermo.h_species(T, self.react_idx)
         s_r = self.thermo.s_species_Pref(T, self.react_idx)
         h_p = self.thermo.h_species(T, self.prod_idx)
@@ -1823,7 +2224,6 @@ class FalloffReactionBatch:
         dRR_from_T_v = dRR_dT * v_T[:, None]
 
         # --- dRR/dC · v ---
-        # concentration contributions (reactants/products) same pattern as elemental
         conc_r_flat = conc_r[:, idx_r_scatter]
         conc_p_flat = conc_p[:, idx_p_scatter]
         kf_r_flat = kf[:, idx_r_scatter]
@@ -1842,7 +2242,7 @@ class FalloffReactionBatch:
         dbase_from_C_v = dbase_from_C_v.scatter_add_(1, idx_r_scatter[None, :].expand(nc, -1), contrib_r_flat)
         dbase_from_C_v = dbase_from_C_v.scatter_add_(1, idx_p_scatter[None, :].expand(nc, -1), contrib_p_flat)
 
-        # add contribution from dkf_from_C_v multiplying concentration expression
+        # Add contribution from dkf_from_C_v multiplying concentration expression
         dRR_from_C_v = dbase_from_C_v + dkf_from_C_v * conc_expr
 
         # --- total dRR·v ---
@@ -1939,13 +2339,23 @@ if __name__ == '__main__':
     C = torch.rand(ncells, nspecies, device=device, dtype=dtype) * 1e-2 + 1e-8
 
     v = torch.randn(ncells, nspecies+1, device=device, dtype=dtype)
+    """
+    print(80* '=')
+    print('elem')
+    print(80* '=')
+
     for reac in r_e:
         reac.compare_jvp(T, C, v[:,0], v[:,1:])
-
+    print(80* '=')
+    print('threebody')
+    print(80* '=')
     for reac in r_tb:
         reac.compare_jvp(T, C, v[:,0], v[:,1:])
-
-
+    print(80* '=')
+    print('falloff')
+    print(80* '=')
+    for reac in r_f:
+        reac.compare_jvp(T, C, v[:,0], v[:,1:])
     """
     # ============================================================
     # UTIL: fonction wrapper RR(T,C) → omega(T,C)
@@ -1964,7 +2374,7 @@ if __name__ == '__main__':
     # ============================================================
     # Génération des états tests
     # ============================================================
-    torch.manual_seed(0)
+    #torch.manual_seed(0)
 
     T = torch.rand(ncells, device=device, dtype=dtype) * 1500 + 300
     C = torch.rand(ncells, nspecies, device=device, dtype=dtype) * 1e-2 + 1e-8
@@ -2016,4 +2426,3 @@ if __name__ == '__main__':
     print(f'\nAnalytic computation time: {t_anneliseitic:.6e} s')
     print(f'Autograd computation time {t_auto:.6e} s')
     print("===================================================\n")
-"""
