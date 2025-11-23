@@ -2,7 +2,7 @@ import numpy as np
 import kineticsGPU.thermo as yaml_thermo
 import torch
 
-torch.set_grad_enabled(True)
+torch.set_grad_enabled(False)
 
 from kineticsGPU.reactionParser import parseReactions, build_reactions
 from kineticsGPU.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch, ReactionSystem
@@ -280,9 +280,9 @@ print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
 Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1, 1)                     # shape (batch_size, state) => odeint will accept
-integrator = BackwardEulerIntegrator(rhs_adiabatic, jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=True, gmres_restart=20)
+integrator = BackwardEulerIntegrator(rhs_adiabatic, jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=False, gmres_restart=20)
 integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
-integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, device=device, dtype=dtype, verbose=True)
+integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, jvp_fn=jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True)
 
 t0 = time.perf_counter()
 jvp = jvp_rhs_adiabatic(Y0, 0.0, Y0)

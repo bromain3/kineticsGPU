@@ -2,7 +2,7 @@ import torch
 import math
 
 #TODO: read Pref from chem file
-#TODO: implement a full GPU parallelization with torch.scatter_add
+#TODO: implement a full GPU parallelization with torch.scatter_add (not in place) for computation speed and scatter_add_ (in place) for memory
 R = 8.31446261815324  # J/(mol*K)
 Pref = 101325.0       # Pa
 
