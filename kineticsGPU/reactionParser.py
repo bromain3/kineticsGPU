@@ -63,12 +63,12 @@ def parseReactions(yaml_file):
             b = rxn.rate.temperature_exponent
             Ea = rxn.rate.activation_energy
 
-            defaultEff = rxn.default_efficiency
+            defaultEff = rxn.third_body.default_efficiency
 
             info["A_SI"] = convert_A_to_SI(A, n_react + 1)  # +1 car molécule tierce
             info["b"] = b
             info["Ea_SI"] = Ea * E_factor
-            info["efficiencies"] = rxn.efficiencies
+            info["efficiencies"] = rxn.third_body.efficiencies
             info['defaultEff'] = defaultEff
 
         elif 'falloff' in rxn.reaction_type:
@@ -94,7 +94,10 @@ def parseReactions(yaml_file):
                 "b": kinf['b'],
                 "Ea_SI": kinf['Ea'] * E_factor,
             }
-            info["efficiencies"] = rxn.efficiencies
+            info["efficiencies"] = rxn.third_body.efficiencies
+            defaultEff = rxn.third_body.default_efficiency
+            info['defaultEff'] = defaultEff
+
 
         else:
             raise TypeError(f"Type de réaction non supporté : {rxn.reaction_type}")
