@@ -50,7 +50,7 @@ class AdaptiveImplicitIntegrator:
 
     def __init__(self,
                  f: Callable[[Tensor, float], Tensor],
-                 device: Optional[torch.device] = None,
+                 device: Optional[torch.device|str] = None,
                  dtype: Optional[torch.dtype] = None,
                  jacobian_fn: Optional[Callable[[Tensor, float], Tensor]] = None,
                  jvp_fn: Optional[Callable[[Tensor, float, Tensor], Tensor]] = None,

@@ -28,7 +28,7 @@ class BackwardEulerIntegrator:
     def __init__(self,
                 f: Callable[[torch.Tensor, float], torch.Tensor],
                 jvp: Optional[Callable[[torch.Tensor, float, torch.Tensor], torch.Tensor]] = None,
-                device: Optional[torch.device] = None,
+                device: Optional[torch.device|str] = None,
                 dtype: Optional[torch.dtype] = None,
                 newton_tol: float = 1e-6,
                 newton_maxiter: int = 20,
