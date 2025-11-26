@@ -233,7 +233,7 @@ def gmres_solve_batched(matvec: Callable[[torch.Tensor], torch.Tensor],
     return x
 
 
-def gmres_givens_batched(
+def gmres_givens_batched( #TODO: add a functionality to give specific indexes to jvp and rhs so that the solving only occurs for unconverged reactors
     matvec: Callable[[torch.Tensor], torch.Tensor],
     rhs: torch.Tensor,
     m_inv: Callable[[torch.Tensor], torch.Tensor] = lambda x: x,
@@ -243,7 +243,7 @@ def gmres_givens_batched(
     verbose: bool = False,
     profile: bool = False,
     device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+) -> torch.Tensor:
     """
     Batched restarted GMRES using incremental Givens rotations (no lstsq).
     - matvec: Callable(B,N)->(B,N). IMPORTANT: matvec should be vectorized on batch dim.

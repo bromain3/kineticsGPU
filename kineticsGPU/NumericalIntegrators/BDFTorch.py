@@ -23,7 +23,8 @@ from kineticsGPU.NumericalIntegrators.utils.linear_operators import make_matvec_
 from kineticsGPU.NumericalIntegrators.utils.preconditioners import identity_precond, make_jacobi_autograd, chemistry_preconditioner
 from kineticsGPU.NumericalIntegrators.utils.dense import dense_solve
 from kineticsGPU.NumericalIntegrators.utils.GMRES import gmres_solve, gmres_givens_batched, gmres_solve_batched
-#TODO: adding Bicgstab(l) solver to replace gmres
+from kineticsGPU.NumericalIntegrators.utils.BiCGStabl import bicgstab_l_batched
+#TODO: add a functionality to give specific indexes to jvp and rhs so that the solving only occurs for unconverged reactors
 class BackwardEulerIntegrator:
     def __init__(self,
                 f: Callable[[torch.Tensor, float], torch.Tensor],
@@ -111,6 +112,14 @@ class BackwardEulerIntegrator:
                                  rhs=rhs,
                                  m_inv=m_inv_fn_eff,
                                  restart=self.gmres_restart,
+                                 tol=self.gmres_tol,
+                                 maxiter=self.gmres_maxiter,
+                                 verbose=self.verbose)
+            elif method == 'bicgstabl':
+                dx = bicgstab_l_batched(matvec=matvec,
+                                 rhs=rhs,
+                                 m_inv=m_inv_fn_eff,
+                                 l=2,
                                  tol=self.gmres_tol,
                                  maxiter=self.gmres_maxiter,
                                  verbose=self.verbose)
