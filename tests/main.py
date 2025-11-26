@@ -173,11 +173,11 @@ def rhs_adiabatic(t, TC):
     cv_mol = cv_mass * rho / np.sum(C)  # J/mol/K
 
     # dérivée de T
-    dHdt = 0.0
+    dUdt = 0.0
     for i, sp in enumerate(thgri.speciesNames):
-        hi = thgri.h(sp, T, P0)  # J/mol
-        dHdt += hi * dCdt[i]
-    dTdt = -dHdt / (np.sum(C) * cv_mol)
+        ui = thgri.h(sp, T, P0) - 8.314_462_618_153_24 * T  # J/mol
+        dUdt += ui * dCdt[i]
+    dTdt = -dUdt / (np.sum(C) * cv_mol)
 
     return np.concatenate(([dTdt], dCdt))
 
@@ -200,22 +200,31 @@ print(time.perf_counter() - t0)
 # === RHS vectorized ===
 def rhs_adiabatic(TC, t):
     T = TC[:, 0]
-    C = TC[:, 1:]
+    C = TC[:, 1:]  # mol/m3
 
-    # cinétique chimique (ton modèle)
+    # cinétique
     dCdt = reaction_system.omega_total(T, C)
 
-    # total molar concentration (mol/m3)
-    n_tot = torch.sum(C, dim=1)
-    # mole fractions X = C / n_tot
+    # concentration totale
+    n_tot = torch.sum(C, dim=1)  # (N,)
+
+    # fractions molaires
     X = C / n_tot[:, None]
-    # mixture molar Cv (J/mol/K)
+
+    # Cv (molaire)
     cv_mol_mix = vec_th.cv_mix_mol(T, X)  # (N,)
-    dHdt_molar = vec_th.h_mix_mol(T, dCdt)
 
-    dTdt = - (dHdt_molar) / (n_tot * cv_mol_mix)
+    # dU/dt = sum_k u_k * dC_k/dt
+    # u_mix_mol renvoie la valeur du mélange pour DONNER Y, pas pour dCdt
+    # → on doit calculer u_species_molar explicitement
+    u_species = vec_th.u_species_mol(T)  # (N, nspecies)
 
-    # assemble result
+    dUdt_molar = torch.sum(u_species * dCdt, dim=1)  # (N,)
+
+    # dT/dt = - dU/dt / (n_tot * Cv)
+    dTdt = - dUdt_molar / (n_tot * cv_mol_mix)
+
+    # assemble
     dTCdt = torch.cat((dTdt[:, None], dCdt), dim=1)
 
     return dTCdt
@@ -227,53 +236,49 @@ def jvp_rhs_adiabatic(TC, t, dTC):
     v_T = dTC[:, 0]
     v_C = dTC[:, 1:]
 
+    # reaction rates and their JVP
+    dCdt = reaction_system.omega_total(T, C)
     dCdt_jvp = reaction_system.jvp(T, C, v_T, v_C)
-    dCdt = reaction_system.omega_total(T, C) # try to avoid recomputing using rhs_adiabatic value
 
+    # total moles
+    n_tot = torch.sum(C, dim=1)
+    dn_tot = torch.sum(v_C, dim=1)
 
-    # ---- Compute n_tot and derivatives ----
-    n_tot = torch.sum(C, dim=1)                      # (N,)
-    dn_tot = torch.sum(v_C, dim=1)                   # (N,)
-
-    # ---- Thermodynamic species properties ----
-    cp_species = vec_th.cp_species(T, torch.arange(len(vec_th.species)))   # (N, ns)
-    cv_species = cp_species - yaml_thermo.R
-
-    # ---- Mixture cv ----
+    # mole fractions
     X = C / n_tot[:, None]
-    cv_mix = vec_th.cv_mix_mol(T, X)                 # (N,)
-    # derivative wrt T:
-    dcp_dT = vec_th.dcp_species_dT(T, torch.arange(len(vec_th.species)))                 # (N, ns)
-    dcv_dT = dcp_dT                                  # since cv = cp - R
-
-    # ---- derivative of X ----
     dX = (v_C / n_tot[:, None]) - (C * dn_tot[:, None] / (n_tot**2)[:, None])
 
-    # ---- dc_v mix ----
+    # species thermodynamics
+    u_species = vec_th.u_species_mol(T)                 # (N, ns)
+    cv_species = vec_th.cv_species_mol(T, torch.arange(0, len(vec_th.species)))               # (N, ns)
+    dcv_dT = vec_th.dcv_species_dT(T, torch.arange(0, len(vec_th.species)))                   # (N, ns)
+
+    # mixture Cv
+    cv_mix = vec_th.cv_mix_mol(T, X)
     dcv_mix = torch.sum(dX * cv_species, dim=1) + torch.sum(X * dcv_dT, dim=1) * v_T
 
-    # ---- H' ----
-    h_species = vec_th.h_species(T, torch.arange(len(vec_th.species)))
+    # U' = Σ u_k * dCk/dt
+    U_prime = torch.sum(u_species * dCdt, dim=1)
 
-    H_prime = torch.sum(h_species * dCdt, dim=1)
+    # dU' = Σ u_k * d(dCk/dt) + Σ dCk/dt * cv_k * vT
+    dU_prime = torch.sum(u_species * dCdt_jvp, dim=1) \
+               + torch.sum(dCdt * cv_species, dim=1) * v_T
 
-    # ---- dH' ----
-    dH_prime = torch.sum(h_species * dCdt_jvp, dim=1) \
-               + torch.sum(dCdt * cp_species, dim=1) * v_T
-
-    # ---- final dT' ----
+    # dT' = linearisation of -U'/(n * Cv)
     dT_prime = (
-          - dH_prime / (n_tot * cv_mix)
-          +  H_prime * dn_tot / (n_tot**2 * cv_mix)
-          +  H_prime * dcv_mix / (n_tot * cv_mix**2)
+        - dU_prime / (n_tot * cv_mix)
+        + U_prime * dn_tot / (n_tot**2 * cv_mix)
+        + U_prime * dcv_mix / (n_tot * cv_mix**2)
     )
+
     return torch.cat([dT_prime[:, None], dCdt_jvp], dim=1)
+
 
 
 # === INTÉGRATION ===
 from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
-from kineticsGPU.NumericalIntegrators.RKF45 import AdaptiveExplicitRKF45
-from kineticsGPU.NumericalIntegrators.BDFAdaTsTorch import AdaptiveImplicitIntegrator
+#from kineticsGPU.NumericalIntegrators.AdaptativeBDFTorch import BackwardEulerIntegrator
+
 dt = 1e-6
 t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
@@ -281,8 +286,9 @@ T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape 
 C0_t = torch.tensor(C0, device=device, dtype=dtype).unsqueeze(0)       # shape (1, n_species)
 Y0 = torch.cat((T0_t, C0_t), dim=1).repeat(1, 1)                     # shape (batch_size, state) => odeint will accept
 integrator = BackwardEulerIntegrator(rhs_adiabatic, jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True, use_autograd_jvp=False, gmres_restart=20)
-integratorrkf45 = AdaptiveExplicitRKF45(rhs_adiabatic, device=device, dtype=dtype, verbose=False)
-integratorAda = AdaptiveImplicitIntegrator(rhs_adiabatic, jvp_fn=jvp_rhs_adiabatic, device=device, dtype=dtype, verbose=True)
+
+res = []
+
 
 t0 = time.perf_counter()
 jvp = jvp_rhs_adiabatic(Y0, 0.0, Y0)
@@ -293,25 +299,13 @@ t0 = time.perf_counter()
 for i, t in enumerate(t_eval_torch):
     print(Y0)
     Y0 = integrator.step(Y0, t, dt, method='gmres', precond='identity') # TODO: investigate memory issue with chemistry preconditioning
-    #Y0 = integratorAda.step_adaptive(Y0, t, dt, method='trapezoid', linear_solver='gmres', precond='identity')
+    res.append(Y0)
+#t_eval_torch, res = integrator.integrate(Y0, (0.0, t_eval_torch[-1].item()), dt)
 
-#t = 0.0
-#h = dt
-#while t < t_eval_torch[-1].item():
-    #Y0, h = integratorrkf45.step_adaptive(Y0, t, dt, atol=1e-8, rtol=1e-8, safety=0.9, controller='PI', verbose=False)
-    #Y0, h = integratorAda.step_adaptive(Y0, t, h, method='backward_euler', linear_solver='gmres', precond='identity', jacobian_reuse=1)
-    #print('\n\n\n\n')
-    #print(Y0)
-    #print('\n\n\n\n')
-    #print(h)
-    #print('\n\n\n\n')
-    #t+=h
-    #print(t)
-
-#sol_torch = odeint(rhs_adiabatic, Y0, t_eval_torch, method='trbdf2')  # shape (n_points, state)
 print(time.perf_counter() - t0)
 # convert solution to numpy for comparisons & plotting
-sol_torch_cpu = Y0.detach().cpu().numpy()   # shape (n_points, nbatches, 1 + n_species)
+res = torch.stack(res, dim=0)
+sol_torch_cpu = res.detach().cpu().numpy()   # shape (n_points, nbatches, 1 + n_species)
 T_torch = sol_torch_cpu[:, 0, 0].flatten()
 C_torch = sol_torch_cpu[:, 0, 1:]  # mol/m3
 X_torch = C_torch / np.sum(C_torch, axis=1, keepdims=True)
@@ -382,7 +376,7 @@ plt.figure(figsize=(10, 6))
 for sp in species_to_plot:
     if sp in thgri.speciesNames:
         i = thgri.speciesNames.index(sp)
-        plt.plot(t_eval, X_torch[:, i], '--', label=f"{sp} (model)")
+        plt.plot(t_eval_torch.cpu(), X_torch[:, i], '--', label=f"{sp} (model)")
         plt.plot(times, X_can[:, i], '-', label=f"{sp} (Cantera)")
 plt.xlabel("Time [s]")
 plt.ylabel("Mole fraction X_i")
@@ -394,7 +388,7 @@ plt.show()
 
 # === Température ===
 plt.figure(figsize=(8, 5))
-plt.plot(t_eval, T_torch, '--', label="My model")
+plt.plot(t_eval_torch.cpu(), T_torch, '--', label="My model")
 plt.plot(times, T_can, '-', label="Cantera")
 plt.xlabel("Time [s]")
 plt.ylabel("Temperature [K]")
@@ -402,4 +396,4 @@ plt.title("Adiabatic Temperature Evolution (CH4/Air)")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.sh
+plt.show()

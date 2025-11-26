@@ -234,6 +234,27 @@ class ThermoData_vectorized:
         h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)  # (ncells, nspecies), J/mol
         return torch.sum(Y * h_species_molar, dim=1)
 
+    def u_mix_mol(self, T, Y):
+        # T : (ncells,)
+        # Y : (ncells, nspecies)
+
+        T = T[:, None]
+        coef = self._select_coef(T)[:, :, :6]  # (ncells, nspecies, 6)
+
+        T_2 = T * T
+        T_3 = T_2 * T
+        T_4 = T_3 * T
+        Temp = torch.stack([torch.ones_like(T), T / 2, T_2 / 3, T_3 / 4, T_4 / 5, 1 / T], dim=-1)  # (ncells, 1, 6)
+
+        # h_species_molar (J/mol)
+        h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)
+
+        # u = h - R*T  (par espèce)
+        u_species_molar = h_species_molar - R * T  # (ncells, nspecies)
+
+        # mélange
+        return torch.sum(Y * u_species_molar, dim=1)  # (ncells,)
+
 
     def s_mix(self, T, P, Y):
         #Y: (ncells, nspecies)
@@ -312,6 +333,34 @@ class ThermoData_vectorized:
 
         return dcp_dT
 
+    def cv_species_mol(self, T, idx):
+        """
+        Capacité calorifique molaire à volume constant pour certaines espèces.
+        T : (ncells,)
+        idx : indices Tensor (n_idx,) ou list
+        Retourne :
+            cv_molar : (ncells, n_idx), J/mol/K
+        """
+        # cp_molar
+        cp_species_molar = self.cp_species(T, idx)  # (ncells, n_idx)
+
+        # Cv = Cp - R  (molaire)
+        cv_species_molar = cp_species_molar - R
+
+        return cv_species_molar
+
+    def dcv_species_dT(self, T, idx):
+        """
+        Dérivée par rapport à T de cv des espèces (J/mol/K^2).
+        Puisque cv = cp - R, on a dcv/dT = dcp/dT.
+        T : (ncells,)
+        idx : indices des espèces
+        Retourne :
+            dcv_dT : (ncells, n_idx)
+        """
+        return self.dcp_species_dT(T, idx)
+
+
     def h_species(self, T, idx, P=Pref):
         """
         Enthalpie molaire (J/mol) pour les espèces d'indice idx.
@@ -334,6 +383,26 @@ class ThermoData_vectorized:
 
         h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)  # (ncells, n_idx)
         return h_species_molar
+
+    def u_species_mol(self, T):
+        # T : (ncells,)
+
+        T = T[:, None]
+        coef = self._select_coef(T)[:, :, :6]  # (ncells, nspecies, 6)
+
+        T_2 = T * T
+        T_3 = T_2 * T
+        T_4 = T_3 * T
+        Temp = torch.stack([torch.ones_like(T), T / 2, T_2 / 3, T_3 / 4, T_4 / 5, 1 / T], dim=-1)  # (ncells, 1, 6)
+
+        # h_species_molar (J/mol)
+        h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)
+
+        # u = h - R*T  (par espèce)
+        u_species_molar = h_species_molar - R * T  # (ncells, nspecies)
+
+        # mélange
+        return u_species_molar  # (ncells,)
 
     def s_species_Pref(self, T, idx):
         """
