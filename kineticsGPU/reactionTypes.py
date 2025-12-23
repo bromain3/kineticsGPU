@@ -222,7 +222,7 @@ class ElementaryReaction:
         print("Max error:", err.item())
         return Jv_ana, Jv_auto, err
 
-
+#TODO: essayer d'implémenter une verison avec sparse matrix pytorch (normalement on a le logarithme et les opérations arithmétiques de base
 class ElementaryReactionBatch:
     """
     Fully GPU-vectorized batch for multiple ElementaryReaction instances.
