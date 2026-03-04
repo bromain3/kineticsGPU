@@ -241,7 +241,6 @@ def gmres_givens_batched( #TODO: add a functionality to give specific indexes to
     tol: float = 1e-6,
     maxiter: int = 50,
     verbose: bool = False,
-    profile: bool = False,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
@@ -425,10 +424,6 @@ def gmres_givens_batched( #TODO: add a functionality to give specific indexes to
             break
 
     timers["total"] = time.time() - start_total
-    print(timers)
+    if verbose:
+        print(timers)
     return x
-"""    if profile:
-        # return timings summary
-        return x, timers
-    else:
-        return x, None"""

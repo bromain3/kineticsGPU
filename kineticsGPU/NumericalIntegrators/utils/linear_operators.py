@@ -34,3 +34,9 @@ def make_matvec_user_defined(jvp: Callable[[torch.Tensor, float, torch.Tensor], 
         jv = jvp(x, t, v)
         return v - h * jv
     return matvec
+
+def make_matvec_user_defined_context(jvp: Callable[[float, torch.Tensor], torch.Tensor], t: float, h: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    def matvec(v: torch.Tensor) -> torch.Tensor:
+        jv = jvp(t, v)
+        return v - h * jv
+    return matvec

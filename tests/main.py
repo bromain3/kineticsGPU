@@ -8,7 +8,7 @@ from kineticsGPU.reactionParser import parseReactions, build_reactions
 from kineticsGPU.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch, ReactionSystem
 from validationReactions import ElementaryReactionVal, ThreeBodyReactionVal, FalloffReactionVal
 
-yaml_file = "gri30.yaml"
+yaml_file = "../kineticsGPU/gri30.yaml"
 dtype = torch.float64
 device = 'cuda'
 y = yaml_thermo.yamlParser(yaml_file)
@@ -49,6 +49,9 @@ for r in reactions:
             falloff_type='troe' if 'troe' in r['type'] else 'lindemann',
             falloff_params=r.get('Troe_params', None)
         ))
+
+    #todo: add a else condition to stop if model not suported
+
 
 r_e, r_tb, r_f, system = build_reactions(vec_th.species, reactions, vec_th, device, dtype)
 
@@ -103,6 +106,11 @@ for i, r in enumerate(list):
         dCdt[:, spe] += coef * RR
     """
 print(time.perf_counter() - t0)
+t0 = time.perf_counter()
+#omega = batched_elem.jvp(T, C, T, C)
+omega = batched_elem.RR(T, C)
+print(time.perf_counter() - t0)
+
 t0 = time.perf_counter()
 #omega = batched_elem.jvp(T, C, T, C)
 omega = batched_elem.RR(T, C)
@@ -279,7 +287,7 @@ def jvp_rhs_adiabatic(TC, t, dTC):
 from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
 #from kineticsGPU.NumericalIntegrators.AdaptativeBDFTorch import BackwardEulerIntegrator
 
-dt = 1e-6
+dt = 1e-7
 t_eval_torch = torch.arange(0, t_end, dt, device=device, dtype=dtype)
 print(len(t_eval_torch))
 T0_t = torch.tensor([T0], device=device, dtype=dtype).unsqueeze(0)      # shape (1,1)
@@ -339,6 +347,9 @@ T_my = sol_my.y[0, :]
 # ==============================================================
 # === GRAPHIQUES ===
 # ==============================================================
+
+
+
 
 species_to_plot = ["CH4", "O2", "CO", "CO2", "H2O", "H", "OH"]
 
