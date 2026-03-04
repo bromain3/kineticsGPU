@@ -14,6 +14,29 @@ def arrhenius(A, n, Ea, T):
     return A * (T ** n) * math.exp(-Ea / (constants.R * T))
 
 @cuda.jit(device=True, inline=False)
+def delta_S0(react_start, react_nb,
+             prod_start,  prod_nb,
+             react_idx,   prod_idx,
+             react_sto,   prod_sto,
+             coefs_high, coefs_low, Tmid, T):
+    """
+    ΔS°(T) = Σ ν_prod * s°_prod  -  Σ ν_react * s°_react
+    Utilise les mêmes polynômes NASA7 que delta_G0, garantissant
+    la cohérence : deltaG0 = deltaH0 - T*deltaS0.
+    """
+    dS = 0.0
+    for i in range(react_nb):
+        idx = react_idx[i + react_start]
+        sto = react_sto[i + react_start]
+        dS -= sto * thermo.s0_nasa7(coefs_high[idx], coefs_low[idx], Tmid[idx], T)
+    for i in range(prod_nb):
+        idx = prod_idx[i + prod_start]
+        sto = prod_sto[i + prod_start]
+        dS += sto * thermo.s0_nasa7(coefs_high[idx], coefs_low[idx], Tmid[idx], T)
+    return dS
+
+
+@cuda.jit(device=True, inline=False)
 def delta_G0(react_start, react_nb,
              prod_start, prod_nb,
              react_idx, prod_idx,

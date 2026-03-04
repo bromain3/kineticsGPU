@@ -131,6 +131,8 @@ class ThermoData_vectorized:
         self.molar_masses = cuda.to_device(np.ascontiguousarray(molar_masses))  # (nspecies,)
         self.nspecies = len(species_names)
 
+    def package_values(self):
+        return(self.coef_high, self.coef_low, self.Tmid)
 
 ###### kernels
 @cuda.jit(device=True, inline=False)
@@ -189,4 +191,19 @@ def h0_nasa7(coefs_high, coefs_low, Tmid, T):
         + a[3] * 0.25  * T4
         + a[4] * 0.2   * T5
         + a[5]
+    )
+
+@cuda.jit(device=True, inline=False)
+def s0_nasa7(coefs_high, coefs_low, Tmid, T):
+    a = _coefs(coefs_high, coefs_low, Tmid, T)
+    T2 = T * T
+    T3 = T2 * T
+    T4 = T3 * T
+    return constants.R * (
+        a[0] * math.log(T)
+        + a[1] * T
+        + a[2] * 0.5  * T2
+        + a[3] / 3.0  * T3
+        + a[4] * 0.25 * T4
+        + a[6]
     )

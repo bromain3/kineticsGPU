@@ -20,7 +20,7 @@ ncells = 1000
 lecteur = thermo.yamlParser(yaml_file)
 lecteur_clas = th_clas.yamlParser(yaml_file)
 th_object = lecteur.populateVectorizedThermoObject()
-clas_th_object = lecteur_clas.populateVectorizedThermoObject(device='cuda:1', dtype=torch.float64)
+clas_th_object = lecteur_clas.populateVectorizedThermoObject(device='cuda:0', dtype=torch.float64)
 
 reactions = parseReactions(yaml_file)
 
@@ -52,10 +52,10 @@ for r in reactions:
             falloff_params=r.get('Troe_params', None)
         ))
 
-r_e, r_tb, r_f, system = build_reactions(clas_th_object.species, reactions, clas_th_object, 'cuda:1', torch.float64)
-batched_elem = ElementaryReactionBatch(r_e, device='cuda:1', dtype=torch.float64)
-batched_tb = ThreeBodyReactionBatch(r_tb, device='cuda:1', dtype=torch.float64)
-batched_falloff = FalloffReactionBatch(r_f, device='cuda:1', dtype=torch.float64)
+r_e, r_tb, r_f, system = build_reactions(clas_th_object.species, reactions, clas_th_object, 'cuda:0', torch.float64)
+batched_elem = ElementaryReactionBatch(r_e, device='cuda:0', dtype=torch.float64)
+batched_tb = ThreeBodyReactionBatch(r_tb, device='cuda:0', dtype=torch.float64)
+batched_falloff = FalloffReactionBatch(r_f, device='cuda:0', dtype=torch.float64)
 
 
 arrays = build_elementary_gpu_arrays(reactions, th_object)
@@ -96,10 +96,10 @@ C = cuda.to_device(np.ascontiguousarray(TC[:, 1:], dtype=np.float64))
 vT = cuda.to_device(np.ascontiguousarray(vTC[:, 0], dtype=np.float64))
 vC = cuda.to_device(np.ascontiguousarray(vTC[:, 1:], dtype=np.float64))
 
-T_torch = torch.tensor(TC[:, 0], device='cuda:1', dtype=torch.float64)
-C_torch = torch.tensor(TC[:, 1:], device='cuda:1', dtype=torch.float64)
-vT_torch = torch.tensor(vTC[:, 0], device='cuda:1', dtype=torch.float64)
-vC_torch = torch.tensor(vTC[:, 1:], device='cuda:1', dtype=torch.float64)
+T_torch = torch.tensor(TC[:, 0], device='cuda:0', dtype=torch.float64)
+C_torch = torch.tensor(TC[:, 1:], device='cuda:0', dtype=torch.float64)
+vT_torch = torch.tensor(vTC[:, 0], device='cuda:0', dtype=torch.float64)
+vC_torch = torch.tensor(vTC[:, 1:], device='cuda:0', dtype=torch.float64)
 
 @cuda.jit # TODO: to improve computation speed, take cell variables as input tu prevent global memory use (and use local arrays in the kernel to have only one global memory read/write)
 def kernel_elem(        # state
