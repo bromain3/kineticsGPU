@@ -3,23 +3,21 @@ integrator_host.py
 ==================
 Couche host Python pour l'intégrateur Backward Euler Numba.
 
-Point clé : pack_all_arrays() fusionne les 4 tuples d'arrays chimiques
-en un seul tuple de 52 éléments pour contourner la limite de 4096 bytes
-d'espace de paramètres des kernels CUDA.
+Solution au dépassement de 4096 bytes de paramètres kernel :
+  Tous les arrays chimiques sont sérialisés dans UN SEUL vecteur 1D float64
+  (data_flat), accompagné de deux petits arrays int32 (offsets, ncols) qui
+  permettent de reconstruire l'accès [i] ou [row, col] dans le kernel.
 
-Usage :
-    integrator = BackwardEulerNumba(
-        elem_arrays, tb_arrays, fo_arrays, thermo_arrays,
-        nsp=53, ncells=512,
-        nreac_elem=206, nreac_tb=15, nreac_fo=21,
-        restart=20, gmres_tol=1e-8, gmres_maxiter=5,
-        newton_tol=1e-8, newton_maxiter=15,
-    )
-    # Pas de temps unique
-    integrator.step(TC_in_dev, TC_out_dev, h)
+  data_flat[offsets[k] + j]                → array 1D k, élément j
+  data_flat[offsets[k] + row*ncols[k]+col] → array 2D k, élément [row,col]
 
-    # Intégration complète sur [0, t_end]
-    integrator.integrate(TC_dev, t_end=1e-3, h=1e-6)
+  Le kernel ne reçoit donc que 3 DeviceNDArrays au lieu de 52.
+
+Layout des 52 arrays (identique à l'ancienne convention _E/_TB/_FO/_TH) :
+  [0..12]  : elem_arrays[0..12]
+  [13..26] : tb_arrays[0..13]
+  [27..48] : fo_arrays[0..21]
+  [49..51] : thermo_arrays[0..2]
 """
 
 import math
@@ -29,42 +27,74 @@ from numba import cuda
 from kineticsGPU.numba_implementation.elementary_reaction import N_CTX_FIELDS   as N_CTX_ELEM
 from kineticsGPU.numba_implementation.three_body_reaction import N_CTX_TB_FIELDS as N_CTX_TB
 from kineticsGPU.numba_implementation.falloff_reaction    import N_CTX_FO_FIELDS as N_CTX_FO
-from kineticsGPU.numba_implementation.backward_euler_numba import backward_euler_step_kernel
+from kineticsGPU.numba_implementation.backward_euler import backward_euler_step_kernel
 
+
+# =============================================================================
+#  Sérialisation des arrays chimiques
+# =============================================================================
 
 def pack_all_arrays(elem_arrays, tb_arrays, fo_arrays, thermo_arrays):
     """
-    Fusionne les 4 tuples d'arrays chimiques en un seul tuple de 52 éléments.
+    Sérialise les 52 arrays chimiques en trois DeviceNDArrays :
+      data_flat (float64, 1D) : données concaténées (valeurs aplaties row-major)
+      offsets   (int32,   1D) : offsets[k] = indice dans data_flat du 1er élément du k-ème array
+      ncols     (int32,   1D) : ncols[k] = nb de colonnes si 2D, 0 si 1D
 
-    Layout résultant (doit correspondre aux constantes _E, _TB, _FO, _TH
-    dans backward_euler_numba.py) :
-        [0..12]  : elem_arrays[0..12]   (13 arrays élémentaires)
-        [13..26] : tb_arrays[0..13]     (14 arrays three-body)
-        [27..48] : fo_arrays[0..21]     (22 arrays falloff)
-        [49..51] : thermo_arrays[0..2]  (3 arrays thermo)
-
-    Note : les fonctions pack_*_context_packaged utilisent 15 arrays pour
-    élémentaires (indices 0..14 dans leur tuple d'origine), mais les arrays
-    thermo sont extraits séparément. On ne garde que les 13 premiers (non-thermo).
-    Vérifiez les indices avec les fichiers yaml_to_GPU_array.py de votre projet.
+    Retourne (data_flat_dev, offsets_dev, ncols_dev).
     """
+    arrays_list = (
+        list(elem_arrays[:13])
+        + list(tb_arrays[:14])
+        + list(fo_arrays[:22])
+        + list(thermo_arrays[:3])
+    )
+    n_arrays = len(arrays_list)  # 52
+
+    offsets_np = np.zeros(n_arrays, dtype=np.int32)
+    ncols_np   = np.zeros(n_arrays, dtype=np.int32)
+
+    # ── Première passe : calcul des offsets ──────────────────────────────
+    cursor = 0
+    host_arrays = []
+    for i, arr in enumerate(arrays_list):
+        if hasattr(arr, 'copy_to_host'):
+            a = arr.copy_to_host()
+        else:
+            a = np.asarray(arr, dtype=np.float64)
+        if a.dtype != np.float64:
+            a = a.astype(np.float64)
+        host_arrays.append(a)
+
+        offsets_np[i] = cursor
+        ncols_np[i]   = a.shape[1] if a.ndim == 2 else 0
+        cursor += a.size
+
+    # ── Deuxième passe : remplissage du vecteur plat ─────────────────────
+    flat_np = np.zeros(cursor, dtype=np.float64)
+    for i, a in enumerate(host_arrays):
+        start = offsets_np[i]
+        flat_np[start : start + a.size] = a.ravel()
+
     return (
-        # Élémentaires : react_idx, react_sto, reactant_number, reactant_offset,
-        #                prod_idx, prod_sto, prod_number, prod_offset,
-        #                A, n, Ea, oneWay, delta_n
-        *elem_arrays[:13],
-        # Three-body : même layout + effmatrix en [13]
-        *tb_arrays[:14],
-        # Falloff : 22 arrays (indices 0..21)
-        *fo_arrays[:22],
-        # Thermo : coef_high, coef_low, Tmid
-        *thermo_arrays[:3],
+        cuda.to_device(flat_np),
+        cuda.to_device(offsets_np),
+        cuda.to_device(ncols_np),
     )
 
 
+# =============================================================================
+#  Grille CUDA
+# =============================================================================
+
 def _grid(ncells, tpb=128):
+    """Retourne (tpb,), (blocks,) — blocks couvre ncells threads."""
     return (tpb,), ((ncells + tpb - 1) // tpb,)
 
+
+# =============================================================================
+#  Intégrateur
+# =============================================================================
 
 class BackwardEulerNumba:
     """
@@ -98,9 +128,10 @@ class BackwardEulerNumba:
                  newton_tol=1e-8,
                  newton_maxiter=15):
 
-        # Fusion en un seul tuple pour le kernel (évite le dépassement de 4096 bytes)
-        self.all_arrays = pack_all_arrays(elem_arrays, tb_arrays,
-                                          fo_arrays, thermo_arrays)
+        # ── Sérialisation en un seul vecteur plat ─────────────────────────
+        self.data_flat, self.arr_offsets, self.arr_ncols = pack_all_arrays(
+            elem_arrays, tb_arrays, fo_arrays, thermo_arrays
+        )
 
         self.nsp      = nsp
         self.ncells   = ncells
@@ -116,7 +147,11 @@ class BackwardEulerNumba:
         rst = restart
         nc  = ncells
 
-        # ── Contextes chimiques ────────────────────────────────────────────
+        # ── nreacs : [nreac_elem, nreac_tb, nreac_fo] passé au kernel ────────
+        self.nreacs = cuda.to_device(
+            np.array([nreac_elem, nreac_tb, nreac_fo], dtype=np.int32))
+
+        # ── Contextes chimiques (gardés pour compatibilité future) ─────────
         self.elem_ctx_buf = cuda.device_array(
             (nc, N_CTX_ELEM, nreac_elem), dtype=np.float64)
         self.tb_ctx_buf   = cuda.device_array(
@@ -127,18 +162,19 @@ class BackwardEulerNumba:
         # ── Buffers réacteur ───────────────────────────────────────────────
         self.rhs_buf     = cuda.device_array((nc, N),   dtype=np.float64)
         self.jvp_tmp_buf = cuda.device_array((nc, N),   dtype=np.float64)
+        self.tmp_fwd_buf = cuda.device_array((nc, N),   dtype=np.float64)
         self.vC_buf      = cuda.device_array((nc, nsp), dtype=np.float64)
         self.F_buf       = cuda.device_array((nc, N),   dtype=np.float64)
 
         # ── Buffers GMRES ──────────────────────────────────────────────────
-        self.gmres_V   = cuda.device_array((nc, (rst + 1) * N),      dtype=np.float64)
-        self.gmres_H   = cuda.device_array((nc, rst * (rst + 1)),     dtype=np.float64)
-        self.gmres_cs  = cuda.device_array((nc, rst),                 dtype=np.float64)
-        self.gmres_sn  = cuda.device_array((nc, rst),                 dtype=np.float64)
-        self.gmres_e1  = cuda.device_array((nc, rst + 1),             dtype=np.float64)
-        self.gmres_y   = cuda.device_array((nc, rst),                 dtype=np.float64)
-        self.gmres_tmp = cuda.device_array((nc, N),                   dtype=np.float64)
-        self.gmres_sol = cuda.device_array((nc, N),                   dtype=np.float64)
+        self.gmres_V   = cuda.device_array((nc, (rst + 1) * N),  dtype=np.float64)
+        self.gmres_H   = cuda.device_array((nc, rst * (rst + 1)), dtype=np.float64)
+        self.gmres_cs  = cuda.device_array((nc, rst),             dtype=np.float64)
+        self.gmres_sn  = cuda.device_array((nc, rst),             dtype=np.float64)
+        self.gmres_e1  = cuda.device_array((nc, rst + 1),         dtype=np.float64)
+        self.gmres_y   = cuda.device_array((nc, rst),             dtype=np.float64)
+        self.gmres_tmp = cuda.device_array((nc, N),               dtype=np.float64)
+        self.gmres_sol = cuda.device_array((nc, N),               dtype=np.float64)
 
         # Info mémoire
         mb = (nc * (N_CTX_ELEM * nreac_elem +
@@ -147,7 +183,9 @@ class BackwardEulerNumba:
                     N * 6 + nsp +
                     (rst + 1) * N + rst * (rst + 1) +
                     rst * 3 + (rst + 1))) * 8 / 1e6
-        print(f"[BackwardEulerNumba] Mémoire GPU : {mb:.1f} Mo "
+        flat_mb = self.data_flat.size * 8 / 1e6
+        print(f"[BackwardEulerNumba] Mémoire GPU : {mb:.1f} Mo (buffers) "
+              f"+ {flat_mb:.1f} Mo (arrays chimiques plats) "
               f"| ncells={nc}, nsp={nsp}, restart={rst}")
 
     # -------------------------------------------------------------------------
@@ -162,12 +200,13 @@ class BackwardEulerNumba:
         backward_euler_step_kernel[blocks, tpb](
             TC_in_dev, TC_out_dev,
             np.float64(h),
-            self.all_arrays,
-            self.elem_ctx_buf,
-            self.tb_ctx_buf,
-            self.fo_ctx_buf,
+            self.data_flat,      # float64[:]  — toutes les données chimiques
+            self.arr_offsets,    # int32[:]    — offsets des 52 arrays
+            self.arr_ncols,      # int32[:]    — ncols (0=1D, >0=2D)
+            self.nreacs,         # int32[3]    — [nreac_elem, nreac_tb, nreac_fo]
             self.rhs_buf,
             self.jvp_tmp_buf,
+            self.tmp_fwd_buf,
             self.vC_buf,
             self.F_buf,
             self.gmres_V,

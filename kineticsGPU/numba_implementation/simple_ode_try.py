@@ -14,8 +14,8 @@ from scipy.integrate import solve_ivp
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-MU  = 10000.0   # stiffness
-RST = 4       # restart GMRES (suffisant pour N=2)
+MU  = 10   # stiffness
+RST = 20       # restart GMRES (suffisant pour N=2)
 
 # =============================================================================
 #  Kernel device : utilitaires GMRES inline
@@ -157,10 +157,10 @@ def _gmres_vdp(b, x, h, y, V, H, cs, sn, e1, yv, tmp, jvp_tmp, tol, maxiter):
 #  Kernel Backward Euler Van der Pol
 # =============================================================================
 
-NEWT_TOL  = 1e-10
-NEWT_ITER = 30
-GMRS_TOL  = 1e-10
-GMRS_IT   = 10
+NEWT_TOL  = 1e-6
+NEWT_ITER = 20
+GMRS_TOL  = 1e-6
+GMRS_IT   = 50
 
 @cuda.jit
 def vdp_be_kernel(Y_in, Y_out, h,
@@ -199,8 +199,8 @@ def main():
     print("=" * 50)
 
     NCELLS = 1
-    T_END  = 2.0
-    H      = 5e-4
+    T_END  = 20.0
+    H      = 3e-3
     N      = 2
 
     # Référence scipy
@@ -209,7 +209,7 @@ def main():
 
     t0  = time.perf_counter()
     ref = solve_ivp(vdp, [0, T_END], [2.0, 0.0],
-                    method='BDF', rtol=1e-12, atol=1e-14, dense_output=True)
+                    method='RK45', rtol=1e-6, atol=1e-6, dense_output=True)
     print(f"\nScipy BDF : {(time.perf_counter()-t0)*1e3:.1f} ms")
     print(f"  y_final = {ref.y[:,-1]}")
 

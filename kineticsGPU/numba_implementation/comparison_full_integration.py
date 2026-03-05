@@ -29,15 +29,15 @@ import matplotlib.pyplot as plt
 # =============================================================================
 
 YAML_FILE      = '../gri30.yaml'
-T0, P0, PHI   = 1500.0, 101325.0, 1.0
+T0, P0, PHI   = 1700.0, 101325.0, 1.0
 T_END          = 1e-3       # s
-H_STEP         = 1e-6       # s (pas fixe)
-NCELLS         = 512
+H_STEP         = 1e-7# s (pas fixe)
+NCELLS         = 1
 RESTART        = 20
-GMRES_TOL      = 1e-8
-GMRES_MAXITER  = 5
-NEWTON_TOL     = 1e-8
-NEWTON_MAXITER = 15
+GMRES_TOL      = 1e-6
+GMRES_MAXITER  = 50
+NEWTON_TOL     = 1e-6
+NEWTON_MAXITER = 20
 
 
 # =============================================================================

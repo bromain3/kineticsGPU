@@ -827,7 +827,7 @@ class ThreeBodyReactionBatch:
         A, n, Ea = [], [], []
 
         # efficacités alignées sur l'ordre des espèces
-        #self.defaultEff_r = torch.tensor([float(r.defaultEff) for r in reactions], dtype=dtype, device=device)
+        self.defaultEff_r = torch.tensor([float(r.defaultEff) for r in reactions], dtype=dtype, device=device)
         for r in reactions:
             self.react_idx_list.extend(r.reactants_idx)
             self.prod_idx_list.extend(r.products_idx)
