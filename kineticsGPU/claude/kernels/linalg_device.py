@@ -1,17 +1,21 @@
 """
 linalg_device.py  — device-side linear algebra for per-thread CUDA kernels.
 
-_gmres_givens_device     : restarted GMRES using a pre-assembled dense J (LU path).
-_gmres_jvp_device        : restarted GMRES using only JVP calls — never builds J.
-    The matvec is  w = v - h * J(xk)·v  computed analytically via _eval_jvp +
-    _adiabatic_jvp_TC.  This is the correct GMRES formulation: one JVP per
-    Krylov vector, no Jacobian assembly.
+Contains only pure linear-algebra primitives; no chemistry imports.
 
-ALL working arrays (V, H, cs, sn, g, w, y) are 1-D slices of
-pre-allocated 2D global memory buffers (shape (B, stride)).
+_gmres_jvp_device lives in integrator_kernel.py (not here) because it calls
+_eval_jvp (chemistry_device) and _adiabatic_jvp_TC (integrator_kernel), and
+Numba does not support imports inside device functions — putting it there
+avoids a circular import while keeping all symbols in one place.
 
-Existing helpers (unchanged): _lu_factor_inplace, _lu_solve,
-    _dot, _norm, _axpy, _copy, _zero, _matvec_dense, _gmres_givens_device
+Public API
+──────────
+  _zero, _copy, _axpy, _dot, _norm
+  _lu_factor_inplace, _lu_solve
+  _matvec_dense
+  _arnoldi_givens_step        ← shared by both GMRES variants
+  _gmres_backsolve            ← shared by both GMRES variants
+  _gmres_givens_device        ← dense-J GMRES (LU path only)
 """
 
 import math
@@ -119,16 +123,11 @@ def _lu_solve(LU_flat, piv, rhs, x, n):
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Dense matrix-vector product  w = J_flat · v
-#  (kept for _gmres_givens_device which is still used by the LU path diagnostics
-#   and any caller that has already built the explicit Jacobian)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True, inline=True)
 def _matvec_dense(J_flat, v, w, n):
-    """
-    w[i] = sum_j J_flat[i*n + j] * v[j]
-    All arrays are 1-D slices of global memory — no local arrays.
-    """
+    """w[i] = sum_j J_flat[i*n + j] * v[j]"""
     for i in range(n):
         s = float64(0.0)
         base = i * n
@@ -138,26 +137,18 @@ def _matvec_dense(J_flat, v, w, n):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Shared Arnoldi + Givens inner loop
-#  Called by both GMRES variants; the only difference is how w = A·v is computed.
-#  This helper receives w already filled by the caller.
+#  Arnoldi + Givens step
+#
+#  Shared by _gmres_givens_device (below) and _gmres_jvp_device (integrator_kernel.py).
+#  On entry : gmres_w  holds  A·V[j]  (matvec result, filled by caller).
+#  On exit  : V[j+1] normalised, H/cs/sn/g updated.
+#  Returns  : |g[j+1]|  (Givens-rotated residual estimate).
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True, inline=True)
-def _arnoldi_givens_step(
-    gmres_V, gmres_H, gmres_cs, gmres_sn, gmres_g, gmres_w,
-    j, n, R,
-):
-    """
-    One Arnoldi step + incremental Givens rotation.
-    On entry  : gmres_w  holds  A·V[j]  (the matvec result).
-    On exit   : gmres_V[j+1] is the new basis vector,
-                gmres_H, gmres_cs, gmres_sn, gmres_g are updated.
-    Returns   : |g[j+1]|  (the Givens-rotated residual estimate).
-    """
-    vj_base = j * n
-
-    # Gram-Schmidt: project w ⊥ V[0..j]
+def _arnoldi_givens_step(gmres_V, gmres_H, gmres_cs, gmres_sn, gmres_g,
+                         gmres_w, j, n, R):
+    # Gram-Schmidt orthogonalisation
     for i in range(j + 1):
         vi_base = i * n
         h_ij = float64(0.0)
@@ -186,14 +177,14 @@ def _arnoldi_givens_step(
 
     # Apply previous Givens rotations to column j
     for i in range(j):
-        h_i   = gmres_H[i * R + j]
-        h_i1  = gmres_H[(i + 1) * R + j]
-        c     = gmres_cs[i]
-        s     = gmres_sn[i]
+        h_i  = gmres_H[i * R + j]
+        h_i1 = gmres_H[(i + 1) * R + j]
+        c    = gmres_cs[i]
+        s    = gmres_sn[i]
         gmres_H[i * R + j]       =  c * h_i + s * h_i1
         gmres_H[(i + 1) * R + j] = -s * h_i + c * h_i1
 
-    # New Givens rotation
+    # New Givens rotation to eliminate H[j+1, j]
     h_jj   = gmres_H[j * R + j]
     h_j1j2 = gmres_H[(j + 1) * R + j]
     r_diag = math.sqrt(h_jj * h_jj + h_j1j2 * h_j1j2)
@@ -217,7 +208,7 @@ def _arnoldi_givens_step(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Back-substitution shared by both GMRES variants
+#  Back-substitution  (shared by both GMRES variants)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True, inline=True)
@@ -231,23 +222,23 @@ def _gmres_backsolve(gmres_H, gmres_g, gmres_y, m, R):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Restarted GMRES — dense-matvec variant (used by LU-path callers that already
-#  have the explicit Jacobian assembled in J_flat).
-#  Interface unchanged from v4.
+#  Restarted GMRES — dense-matvec variant
+#  Used when the explicit Jacobian J_flat is already assembled (LU path).
+#  Interface identical to v4.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True)
 def _gmres_givens_device(
-    J_flat,        # (n*n,)      global — Jacobian row-major, READ-ONLY
-    rhs,           # (n,)        local  — right-hand side  (-F)
-    dx,            # (n,)        global — solution (zeroed by caller)
-    gmres_V,       # ((R+1)*n,)  global
-    gmres_H,       # ((R+1)*R,)  global
-    gmres_cs,      # (R,)        global
-    gmres_sn,      # (R,)        global
-    gmres_g,       # (R+1,)      global
-    gmres_w,       # (n,)        global
-    gmres_y,       # (R,)        global
+    J_flat,        # (n*n,)   — Jacobian row-major, READ-ONLY
+    rhs,           # (n,)     — right-hand side (-F)
+    dx,            # (n,)     — solution, zeroed by caller
+    gmres_V,       # ((R+1)*n,)
+    gmres_H,       # ((R+1)*R,)
+    gmres_cs,      # (R,)
+    gmres_sn,      # (R,)
+    gmres_g,       # (R+1,)
+    gmres_w,       # (n,)
+    gmres_y,       # (R,)
     n,
     restart,
     gmres_tol,
@@ -317,316 +308,6 @@ def _gmres_givens_device(
         res_true = float64(0.0)
         for i in range(n):
             ri = rhs[i] - gmres_w[i]
-            res_true += ri * ri
-        res_true = math.sqrt(res_true)
-
-        if res_true < gmres_tol or j_converged < R:
-            return
-
-        beta = res_true
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Restarted GMRES — JVP variant  (true matrix-free GMRES)
-#
-#  The matvec is  w = v - h * J(xk)·v  computed via the analytical JVP
-#  functions _eval_jvp + _adiabatic_jvp_TC.
-#  No Jacobian matrix is ever assembled or read.
-#
-#  Caller contract (same buffer shapes as _gmres_givens_device):
-#    • dx zeroed before call.
-#    • All gmres_X are 1-D slices of shape (stride,) from global 2-D buffers.
-#    • T_loc, C_loc reflect the current Newton iterate xk.
-#    • The chemistry context buffers (ctx_*) are already filled for xk by
-#      the preceding _eval_rhs_and_context call in the Newton loop.
-# ─────────────────────────────────────────────────────────────────────────────
-
-@cuda.jit(device=True)
-def _gmres_jvp_device(
-    # Newton iterate state
-    T_loc,         # float64 scalar — current temperature
-    C_loc,         # (n_species,)  — current concentrations (local array)
-    h,             # float64 scalar — time step
-    # Chemistry context (already evaluated for xk)
-    ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
-    ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
-    ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
-    ctx_baseRR_tb, ctx_M_tb,
-    ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
-    ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
-    ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
-    ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
-    ctx_Fcent_fall, ctx_logFcent_fall,
-    ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
-    ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
-    omega_loc,     # (n_species,)  — omega already evaluated for xk
-    # Mechanism arrays
-    n_species,
-    thermo_coef_low, thermo_coef_high, thermo_Tmid,
-    n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
-    e_react_idx, e_react_sto, e_react_offset,
-    e_prod_idx, e_prod_sto, e_prod_offset,
-    e_idx_r_scatter, e_idx_p_scatter,
-    n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
-    tb_react_idx, tb_react_sto, tb_react_offset,
-    tb_prod_idx, tb_prod_sto, tb_prod_offset,
-    tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
-    n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
-    fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
-    fall_oneWay, fall_delta_n,
-    fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
-    fall_react_idx, fall_react_sto, fall_react_offset,
-    fall_prod_idx, fall_prod_sto, fall_prod_offset,
-    fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
-    # GMRES buffers (1-D slices of 2-D global arrays)
-    rhs,           # (n_state,)    — right-hand side (-F), READ-ONLY
-    dx,            # (n_state,)    — solution, zeroed by caller
-    gmres_V,       # ((R+1)*n,)
-    gmres_H,       # ((R+1)*R,)
-    gmres_cs,      # (R,)
-    gmres_sn,      # (R,)
-    gmres_g,       # (R+1,)
-    gmres_w,       # (n_state,)    — Arnoldi work vector (also used as Jv_TC)
-    gmres_y,       # (R,)
-    # Sizes and tolerances
-    n_state,
-    restart,
-    gmres_tol,
-    gmres_maxiter,
-):
-    """
-    Matrix-free restarted GMRES.
-    The implicit system is  (I - h·J)·dx = rhs.
-    Each matvec computes  w = v - h·J·v  via one analytical JVP call,
-    exactly as done in the PyTorch version with make_matvec_user_defined_context.
-    """
-    from .linalg_device import _arnoldi_givens_step, _gmres_backsolve
-    from .chemistry_device import _eval_jvp
-    from ..kernels.integrator_kernel import _adiabatic_jvp_TC
-
-    # These imports resolve at JIT compile time (Numba inlines device functions).
-    # They are declared here for readability; the actual references are at module
-    # level in integrator_kernel.py which already imports both symbols.
-
-    beta = float64(0.0)
-    for i in range(n_state):
-        beta += rhs[i] * rhs[i]
-    beta = math.sqrt(beta)
-    if beta < gmres_tol:
-        return
-
-    R = restart
-
-    # Temporary storage for the Jv intermediate — we reuse gmres_w for Jv_TC
-    # and need a separate slice for Jv_omega.  We use the first n_species
-    # elements of gmres_y as scratch (gmres_y is (R,) with R >= n_state > n_species
-    # in all practical cases; if R < n_species the caller must ensure a separate
-    # buffer).  To be safe we use gmres_V[(R)*n_state : (R)*n_state + n_species]
-    # as the Jv_omega scratch (it is the V[R] slot which is never read after
-    # the Arnoldi loop ends).
-    Jv_omega_base = R * n_state   # offset into gmres_V for the scratch slot
-
-    for outer in range(gmres_maxiter):
-        for idx in range((R + 1) * R):
-            gmres_H[idx] = float64(0.0)
-        for idx in range(R):
-            gmres_cs[idx] = float64(0.0)
-            gmres_sn[idx] = float64(0.0)
-        for idx in range(R + 1):
-            gmres_g[idx] = float64(0.0)
-
-        # ── Compute initial residual r = rhs - (I - h·J)·dx ──────────────
-        if outer == 0:
-            # dx = 0 → r = rhs
-            inv_beta = float64(1.0) / beta
-            for i in range(n_state):
-                gmres_V[i] = rhs[i] * inv_beta
-        else:
-            # r = rhs - (dx - h·J·dx) = rhs - dx + h·J·dx
-            # Compute (I - h·J)·dx via JVP
-            v_T   = dx[0]
-            for s in range(n_state - 1):
-                gmres_V[Jv_omega_base + s] = dx[s + 1]   # reuse as v_C scratch
-
-            _eval_jvp(
-                T_loc, C_loc, v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-                ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
-                ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
-                ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
-                ctx_baseRR_tb, ctx_M_tb,
-                ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
-                ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
-                ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
-                ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
-                ctx_Fcent_fall, ctx_logFcent_fall,
-                ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
-                ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
-                gmres_V[Jv_omega_base:Jv_omega_base + n_state],  # Jv_omega output
-                n_species,
-                thermo_coef_low, thermo_coef_high, thermo_Tmid,
-                n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
-                e_react_idx, e_react_sto, e_react_offset,
-                e_prod_idx, e_prod_sto, e_prod_offset,
-                e_idx_r_scatter, e_idx_p_scatter,
-                n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
-                tb_react_idx, tb_react_sto, tb_react_offset,
-                tb_prod_idx, tb_prod_sto, tb_prod_offset,
-                tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
-                n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
-                fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
-                fall_oneWay, fall_delta_n,
-                fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
-                fall_react_idx, fall_react_sto, fall_react_offset,
-                fall_prod_idx, fall_prod_sto, fall_prod_offset,
-                fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
-            )
-            # gmres_w = Jv_TC  (complete JVP including temperature equation)
-            _adiabatic_jvp_TC(
-                T_loc, C_loc, v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-                omega_loc, gmres_V[Jv_omega_base:Jv_omega_base + n_state],
-                n_species,
-                thermo_coef_low, thermo_coef_high, thermo_Tmid,
-                gmres_w,   # output: Jv_TC
-            )
-            # r = rhs - (dx - h*Jv_TC) = rhs - dx + h*gmres_w
-            beta = float64(0.0)
-            for i in range(n_state):
-                ri = rhs[i] - dx[i] + h * gmres_w[i]
-                gmres_w[i] = ri
-                beta += ri * ri
-            beta = math.sqrt(beta)
-            if beta < gmres_tol:
-                return
-            inv_beta = float64(1.0) / beta
-            for i in range(n_state):
-                gmres_V[i] = gmres_w[i] * inv_beta
-
-        gmres_g[0] = beta
-        j_converged = R
-
-        # ── Arnoldi loop ──────────────────────────────────────────────────
-        for j in range(R):
-            vj_base = j * n_state
-
-            # ── matvec: w = v_j - h * J · v_j  (one analytical JVP) ──────
-            v_T = gmres_V[vj_base]
-            for s in range(n_state - 1):
-                gmres_V[Jv_omega_base + s] = gmres_V[vj_base + s + 1]
-
-            _eval_jvp(
-                T_loc, C_loc,
-                v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-                ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
-                ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
-                ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
-                ctx_baseRR_tb, ctx_M_tb,
-                ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
-                ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
-                ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
-                ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
-                ctx_Fcent_fall, ctx_logFcent_fall,
-                ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
-                ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
-                gmres_V[Jv_omega_base:Jv_omega_base + n_state],  # Jv_omega
-                n_species,
-                thermo_coef_low, thermo_coef_high, thermo_Tmid,
-                n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
-                e_react_idx, e_react_sto, e_react_offset,
-                e_prod_idx, e_prod_sto, e_prod_offset,
-                e_idx_r_scatter, e_idx_p_scatter,
-                n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
-                tb_react_idx, tb_react_sto, tb_react_offset,
-                tb_prod_idx, tb_prod_sto, tb_prod_offset,
-                tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
-                n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
-                fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
-                fall_oneWay, fall_delta_n,
-                fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
-                fall_react_idx, fall_react_sto, fall_react_offset,
-                fall_prod_idx, fall_prod_sto, fall_prod_offset,
-                fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
-            )
-            _adiabatic_jvp_TC(
-                T_loc, C_loc,
-                v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-                omega_loc, gmres_V[Jv_omega_base:Jv_omega_base + n_state],
-                n_species,
-                thermo_coef_low, thermo_coef_high, thermo_Tmid,
-                gmres_w,   # Jv_TC output → used immediately below
-            )
-            # w = v - h * Jv_TC  (the implicit system matvec (I - h·J)·v)
-            for i in range(n_state):
-                gmres_w[i] = gmres_V[vj_base + i] - h * gmres_w[i]
-
-            # Arnoldi orthogonalisation + Givens rotation (shared helper)
-            res_est = _arnoldi_givens_step(
-                gmres_V, gmres_H, gmres_cs, gmres_sn, gmres_g, gmres_w,
-                j, n_state, R,
-            )
-            if res_est < gmres_tol:
-                j_converged = j + 1
-                break
-
-        # ── Back-substitution ─────────────────────────────────────────────
-        m = j_converged
-        _gmres_backsolve(gmres_H, gmres_g, gmres_y, m, R)
-
-        # ── dx += V[:, 0:m] · y ───────────────────────────────────────────
-        for i in range(n_state):
-            acc = float64(0.0)
-            for k in range(m):
-                acc += gmres_V[k * n_state + i] * gmres_y[k]
-            dx[i] += acc
-
-        # ── True residual via JVP ─────────────────────────────────────────
-        v_T = dx[0]
-        for s in range(n_state - 1):
-            gmres_V[Jv_omega_base + s] = dx[s + 1]
-
-        _eval_jvp(
-            T_loc, C_loc,
-            v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-            ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
-            ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
-            ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
-            ctx_baseRR_tb, ctx_M_tb,
-            ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
-            ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
-            ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
-            ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
-            ctx_Fcent_fall, ctx_logFcent_fall,
-            ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
-            ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
-            gmres_V[Jv_omega_base:Jv_omega_base + n_state],
-            n_species,
-            thermo_coef_low, thermo_coef_high, thermo_Tmid,
-            n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
-            e_react_idx, e_react_sto, e_react_offset,
-            e_prod_idx, e_prod_sto, e_prod_offset,
-            e_idx_r_scatter, e_idx_p_scatter,
-            n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
-            tb_react_idx, tb_react_sto, tb_react_offset,
-            tb_prod_idx, tb_prod_sto, tb_prod_offset,
-            tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
-            n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
-            fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
-            fall_oneWay, fall_delta_n,
-            fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
-            fall_react_idx, fall_react_sto, fall_react_offset,
-            fall_prod_idx, fall_prod_sto, fall_prod_offset,
-            fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
-        )
-        _adiabatic_jvp_TC(
-            T_loc, C_loc,
-            v_T, gmres_V[Jv_omega_base:Jv_omega_base + n_state - 1],
-            omega_loc, gmres_V[Jv_omega_base:Jv_omega_base + n_state],
-            n_species,
-            thermo_coef_low, thermo_coef_high, thermo_Tmid,
-            gmres_w,
-        )
-        res_true = float64(0.0)
-        for i in range(n_state):
-            ri = rhs[i] - (dx[i] - h * gmres_w[i])
             res_true += ri * ri
         res_true = math.sqrt(res_true)
 

@@ -91,7 +91,7 @@ class CUDABackwardEulerIntegrator:
         newton_tol: float = 1e-6,
         newton_maxiter: int = 20,
         reuse_jacobian: bool = True,
-        linear_solver: str = 'lu',
+        linear_solver: str = 'gmres',
         gmres_restart: int = 20,
         gmres_tol: float = 1e-6,
         gmres_maxiter: int = 50,
@@ -173,13 +173,15 @@ class CUDABackwardEulerIntegrator:
         # Full allocation when linear_solver='gmres'; 2-D dummies (B,1)
         # otherwise so that buf_gmres_X[b] is always a typed 1-D array.
         if self.linear_solver == 1:
-            self._d_gmres_V  = buf((B, (R + 2) * Nst))
+            self._d_gmres_V  = buf((B, (R + 1) * Nst))
             self._d_gmres_H  = buf((B, (R + 1) * R))
             self._d_gmres_cs = buf((B, R))
             self._d_gmres_sn = buf((B, R))
             self._d_gmres_g  = buf((B, R + 1))
             self._d_gmres_w  = buf((B, Nst))
             self._d_gmres_y  = buf((B, R))
+            self._d_gmres_vC  = buf((B, Nst))   # ← NEW: v_C scratch
+            self._d_gmres_Jvo = buf((B, Nst))   # ← NEW: Jv_omega scratch
         else:
             self._d_gmres_V  = dummy2d()
             self._d_gmres_H  = dummy2d()
@@ -188,11 +190,18 @@ class CUDABackwardEulerIntegrator:
             self._d_gmres_g  = dummy2d()
             self._d_gmres_w  = dummy2d()
             self._d_gmres_y  = dummy2d()
+            self._d_gmres_vC  = dummy2d()        # ← NEW dummy
+            self._d_gmres_Jvo = dummy2d()        # ← NEW dummy
 
         # ── Timing buffer — always allocated, zeros until do_timing=True ──
         self._d_timers = cuda.device_array((B, N_TIMER_PHASES), dtype=np.int64)
         self._d_timers.copy_to_device(
             np.zeros((B, N_TIMER_PHASES), dtype=np.int64)
+        )
+
+        self._d_iters = cuda.device_array((B, 2), dtype=np.int64)
+        self._d_iters.copy_to_device(
+            np.zeros((B, 2), dtype=np.int64)
         )
 
         # ── Chemistry context ─────────────────────────────────────────────
@@ -241,7 +250,7 @@ class CUDABackwardEulerIntegrator:
     #  step()
     # ─────────────────────────────────────────────────────────────────────
 
-    def step(self, t: float, h: float, do_timing: bool = False):
+    def step(self, t: float, h: float, do_timing: bool = False, do_count: bool = False):
         B = self.B
         self._d_h_arr.copy_to_device(np.full(B, h, dtype=self.dtype))
         self._d_t_arr.copy_to_device(np.full(B, t, dtype=self.dtype))
@@ -263,6 +272,8 @@ class CUDABackwardEulerIntegrator:
             self._d_gmres_g,
             self._d_gmres_w,
             self._d_gmres_y,
+            self._d_gmres_vC,  # ← NEW
+            self._d_gmres_Jvo,  # ← NEW
             # Context – elementary
             self._d_ctx_kf_e,   self._d_ctx_Kc_e,
             self._d_ctx_cr_e,   self._d_ctx_cp_e,  self._d_ctx_RR_e,
@@ -293,6 +304,9 @@ class CUDABackwardEulerIntegrator:
             # Timing
             self._d_timers,
             np.int32(1 if do_timing else 0),
+            # Counting
+            self._d_iters,
+            np.int32(1 if do_count else 0),
             # Mechanism
             *self._mech_args,
         )
@@ -311,6 +325,7 @@ class CUDABackwardEulerIntegrator:
         h: float,
         save_every: int = 1,
         do_timing: bool = False,
+        do_count: bool = False,
     ):
         """
         Integrate from t0 to t_end with fixed step h.
@@ -337,7 +352,7 @@ class CUDABackwardEulerIntegrator:
             if h_eff <= 0.0:
                 break
 
-            self.step(t, h_eff, do_timing=do_timing)
+            self.step(t, h_eff, do_timing=do_timing, do_count=do_count)
             t += h_eff
 
             if step_i % save_every == 0:

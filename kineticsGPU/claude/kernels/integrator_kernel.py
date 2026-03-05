@@ -1,35 +1,53 @@
 """
-Per-thread backward Euler integrator CUDA kernel — v4 (LU + GMRES + timing).
+Per-thread backward Euler integrator CUDA kernel — v5 (LU + matrix-free GMRES + timing).
 
 Linear solver selection
 ───────────────────────
-  linear_solver == 0  →  LU factorisation  (original)
-  linear_solver == 1  →  restarted GMRES with Givens rotations
+  linear_solver == 0  →  LU factorisation
+  linear_solver == 1  →  restarted GMRES, MATRIX-FREE.
+                         Each Krylov matvec  w = v - h·J·v  is one analytical
+                         JVP call (_eval_jvp + _adiabatic_jvp_TC).
+                         The Jacobian matrix is NEVER assembled.
+                         ALL intermediate storage uses pre-allocated global
+                         memory buffers — no cuda.local.array, no shared memory.
+
+Why _gmres_jvp_device lives here (not in linalg_device.py)
+───────────────────────────────────────────────────────────
+Numba does not support imports inside device functions.
+_gmres_jvp_device calls _eval_jvp (chemistry_device) and _adiabatic_jvp_TC
+(this file). Defining it here avoids the circular import.
+
+Global buffers used by _gmres_jvp_device (allocated in integrator.py)
+──────────────────────────────────────────────────────────────────────
+  buf_gmres_V    (B, (R+1)*N)   Krylov basis
+  buf_gmres_H    (B, (R+1)*R)   Hessenberg matrix
+  buf_gmres_cs   (B, R)         Givens cosines
+  buf_gmres_sn   (B, R)         Givens sines
+  buf_gmres_g    (B, R+1)       rotated RHS
+  buf_gmres_w    (B, N)         Arnoldi work / matvec output
+  buf_gmres_y    (B, R)         back-substitution result
+  buf_gmres_vC   (B, N)         v_C scratch for _eval_jvp input
+  buf_gmres_Jvo  (B, N)         Jv_omega scratch for _eval_jvp output
+
+Divergence counters (optional, allocated in integrator.py)
+──────────────────────────────────────────────────────────
+  buf_iters  (B, 2) int32
+    col 0 : n_newton_iters  — Newton iterations performed this step
+    col 1 : n_krylov_iters  — total Krylov vectors produced this step
+                              (sum over all GMRES restarts)
+  do_count   int32  0=off  1=on
+  When do_count=0, buf_iters can be a (B,1) dummy.
 
 Timing instrumentation
 ──────────────────────
-Enabled by passing  do_timing=1  to the kernel.
-Each thread accumulates per-phase cycle counts via cuda.clock64().
-Seven phases are measured (indices into buf_timers, shape (B, 7)):
-
+Seven phases (buf_timers shape (B, 7)):
   0  PREDICTOR   : initial RHS eval + explicit Euler step
   1  RHS         : _eval_rhs_and_context inside Newton loop
-  2  RESIDUAL    : residual norm computation
-  3  JAC_ASSEM   : Jacobian assembly (_assemble_jacobian)
-  4  LU_FACTOR   : LU factorisation  (linear_solver=0 only)
+  2  RESIDUAL    : residual norm
+  3  JAC_ASSEM   : Jacobian assembly — LU path only (always 0 for GMRES)
+  4  LU_FACTOR   : LU factorisation  — LU path only (always 0 for GMRES)
   5  LINEAR_SOLVE: back-substitution (LU) or full GMRES call
   6  UPDATE      : xk += dx + hard constraints
-
-When do_timing=0 the timing branches are dead code — no overhead.
-
-buf_timers shape: (B, 7) int64  — pre-allocated by the integrator.
-When do_timing=0 pass a dummy (1, 7) array.
-
-IMPORTANT: clock64() counts SM clock cycles, not wall-clock nanoseconds.
-Convert to microseconds on the host:
-    cycles / (SM_clock_GHz * 1e3)
-The SM clock frequency is available via:
-    numba.cuda.get_current_device().clock_rate  # in kHz
 """
 
 import math
@@ -44,13 +62,15 @@ from .chemistry_device import (
 )
 from .linalg_device import (
     _lu_factor_inplace, _lu_solve,
-    _matvec_dense, _gmres_givens_device,
+    _matvec_dense,
+    _arnoldi_givens_step,
+    _gmres_backsolve,
+    _gmres_givens_device,
     _dot, _norm, _axpy, _copy, _zero,
 )
 
 MAX_N_STATE = 54
 
-# Timer phase indices — kept as module-level constants for readability.
 _T_PREDICTOR    = 0
 _T_RHS          = 1
 _T_RESIDUAL     = 2
@@ -61,8 +81,6 @@ _T_UPDATE       = 6
 N_TIMER_PHASES  = 7
 
 
-
-
 from numba.cuda.extending import intrinsic
 from llvmlite import ir
 from numba import types
@@ -70,18 +88,17 @@ from numba import types
 @intrinsic
 def cuda_clock64(typingctx):
     sig = types.uint64()
-
     def codegen(context, builder, sig, args):
         function_type = ir.FunctionType(ir.IntType(64), [])
         instruction = "mov.u64 $0, %clock64;"
         clock64 = ir.InlineAsm(function_type, instruction, "=l",
                                side_effect=True)
         return builder.call(clock64, [])
-
     return sig, codegen
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Adiabatic RHS helpers  (unchanged)
+#  Adiabatic RHS helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True)
@@ -168,7 +185,7 @@ def _adiabatic_jvp_TC(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Dense Jacobian assembly  (unchanged)
+#  Dense Jacobian assembly — LU path only
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cuda.jit(device=True)
@@ -259,6 +276,274 @@ def _assemble_jacobian(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Matrix-free restarted GMRES  (JVP variant)
+#
+#  Returns int32 : total number of Krylov vectors produced.
+#  The caller accumulates this into n_krylov_count for divergence analysis.
+#
+#  Return value encoding:
+#    Early exit (beta < tol before any Arnoldi) → 0
+#    Normal exit after m Krylov steps and `outer` restart cycles
+#      → (outer * R + j_converged)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cuda.jit(device=True)
+def _gmres_jvp_device(
+    T_loc,
+    C_loc,
+    h,
+    ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
+    ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
+    ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
+    ctx_baseRR_tb, ctx_M_tb,
+    ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
+    ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
+    ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
+    ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
+    ctx_Fcent_fall, ctx_logFcent_fall,
+    ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
+    ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
+    omega_loc,
+    n_species,
+    thermo_coef_low, thermo_coef_high, thermo_Tmid,
+    n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
+    e_react_idx, e_react_sto, e_react_offset,
+    e_prod_idx, e_prod_sto, e_prod_offset,
+    e_idx_r_scatter, e_idx_p_scatter,
+    n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
+    tb_react_idx, tb_react_sto, tb_react_offset,
+    tb_prod_idx, tb_prod_sto, tb_prod_offset,
+    tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
+    n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
+    fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
+    fall_oneWay, fall_delta_n,
+    fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
+    fall_react_idx, fall_react_sto, fall_react_offset,
+    fall_prod_idx, fall_prod_sto, fall_prod_offset,
+    fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
+    rhs,
+    dx,
+    gmres_V,
+    gmres_H,
+    gmres_cs,
+    gmres_sn,
+    gmres_g,
+    gmres_w,
+    gmres_y,
+    gmres_vC,
+    gmres_Jvo,
+    n_state,
+    restart,
+    gmres_tol,
+    gmres_maxiter,
+):
+    beta = float64(0.0)
+    for i in range(n_state):
+        beta += rhs[i] * rhs[i]
+    beta = math.sqrt(beta)
+    if beta < gmres_tol:
+        return int32(0)
+
+    R = restart
+    total_krylov = int32(0)
+
+    for outer in range(gmres_maxiter):
+        for idx in range((R + 1) * R):
+            gmres_H[idx] = float64(0.0)
+        for idx in range(R):
+            gmres_cs[idx] = float64(0.0)
+            gmres_sn[idx] = float64(0.0)
+        for idx in range(R + 1):
+            gmres_g[idx] = float64(0.0)
+
+        if outer == 0:
+            inv_beta = float64(1.0) / beta
+            for i in range(n_state):
+                gmres_V[i] = rhs[i] * inv_beta
+        else:
+            v_T = dx[0]
+            for s in range(n_species):
+                gmres_vC[s] = dx[s + 1]
+            _eval_jvp(
+                T_loc, C_loc,
+                v_T, gmres_vC,
+                ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
+                ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
+                ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
+                ctx_baseRR_tb, ctx_M_tb,
+                ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
+                ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
+                ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
+                ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
+                ctx_Fcent_fall, ctx_logFcent_fall,
+                ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
+                ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
+                gmres_Jvo,
+                n_species,
+                thermo_coef_low, thermo_coef_high, thermo_Tmid,
+                n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
+                e_react_idx, e_react_sto, e_react_offset,
+                e_prod_idx, e_prod_sto, e_prod_offset,
+                e_idx_r_scatter, e_idx_p_scatter,
+                n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
+                tb_react_idx, tb_react_sto, tb_react_offset,
+                tb_prod_idx, tb_prod_sto, tb_prod_offset,
+                tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
+                n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
+                fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
+                fall_oneWay, fall_delta_n,
+                fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
+                fall_react_idx, fall_react_sto, fall_react_offset,
+                fall_prod_idx, fall_prod_sto, fall_prod_offset,
+                fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
+            )
+            _adiabatic_jvp_TC(
+                T_loc, C_loc, v_T, gmres_vC,
+                omega_loc, gmres_Jvo,
+                n_species,
+                thermo_coef_low, thermo_coef_high, thermo_Tmid,
+                gmres_w,
+            )
+            beta = float64(0.0)
+            for i in range(n_state):
+                ri = rhs[i] - dx[i] + h * gmres_w[i]
+                gmres_w[i] = ri
+                beta += ri * ri
+            beta = math.sqrt(beta)
+            if beta < gmres_tol:
+                return total_krylov
+            inv_beta = float64(1.0) / beta
+            for i in range(n_state):
+                gmres_V[i] = gmres_w[i] * inv_beta
+
+        gmres_g[0] = beta
+        j_converged = R
+
+        for j in range(R):
+            vj_base = j * n_state
+            v_T = gmres_V[vj_base]
+            for s in range(n_species):
+                gmres_vC[s] = gmres_V[vj_base + s + 1]
+            _eval_jvp(
+                T_loc, C_loc,
+                v_T, gmres_vC,
+                ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
+                ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
+                ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
+                ctx_baseRR_tb, ctx_M_tb,
+                ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
+                ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
+                ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
+                ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
+                ctx_Fcent_fall, ctx_logFcent_fall,
+                ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
+                ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
+                gmres_Jvo,
+                n_species,
+                thermo_coef_low, thermo_coef_high, thermo_Tmid,
+                n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
+                e_react_idx, e_react_sto, e_react_offset,
+                e_prod_idx, e_prod_sto, e_prod_offset,
+                e_idx_r_scatter, e_idx_p_scatter,
+                n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
+                tb_react_idx, tb_react_sto, tb_react_offset,
+                tb_prod_idx, tb_prod_sto, tb_prod_offset,
+                tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
+                n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
+                fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
+                fall_oneWay, fall_delta_n,
+                fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
+                fall_react_idx, fall_react_sto, fall_react_offset,
+                fall_prod_idx, fall_prod_sto, fall_prod_offset,
+                fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
+            )
+            _adiabatic_jvp_TC(
+                T_loc, C_loc, v_T, gmres_vC,
+                omega_loc, gmres_Jvo,
+                n_species,
+                thermo_coef_low, thermo_coef_high, thermo_Tmid,
+                gmres_w,
+            )
+            for i in range(n_state):
+                gmres_w[i] = gmres_V[vj_base + i] - h * gmres_w[i]
+
+            res_est = _arnoldi_givens_step(
+                gmres_V, gmres_H, gmres_cs, gmres_sn, gmres_g, gmres_w,
+                j, n_state, R,
+            )
+            if res_est < gmres_tol:
+                j_converged = j + 1
+                break
+
+        total_krylov += int32(j_converged)
+
+        m = j_converged
+        _gmres_backsolve(gmres_H, gmres_g, gmres_y, m, R)
+
+        for i in range(n_state):
+            acc = float64(0.0)
+            for k in range(m):
+                acc += gmres_V[k * n_state + i] * gmres_y[k]
+            dx[i] += acc
+
+        v_T = dx[0]
+        for s in range(n_species):
+            gmres_vC[s] = dx[s + 1]
+        _eval_jvp(
+            T_loc, C_loc,
+            v_T, gmres_vC,
+            ctx_kf_e, ctx_Kc_e, ctx_conc_r_e, ctx_conc_p_e,
+            ctx_deltaG0_e, ctx_s_r_e, ctx_s_p_e,
+            ctx_kf_tb, ctx_Kc_tb, ctx_conc_r_tb, ctx_conc_p_tb,
+            ctx_baseRR_tb, ctx_M_tb,
+            ctx_deltaG0_tb, ctx_s_r_tb, ctx_s_p_tb,
+            ctx_kf_fall, ctx_Kc_fall, ctx_conc_r_fall, ctx_conc_p_fall,
+            ctx_k0_fall, ctx_kinf_fall, ctx_M_fall,
+            ctx_Pr_fall, ctx_F_fall, ctx_kbase_fall,
+            ctx_Fcent_fall, ctx_logFcent_fall,
+            ctx_C_par_fall, ctx_N_par_fall, ctx_f1_fall, ctx_exp_fall,
+            ctx_deltaG0_fall, ctx_s_r_fall, ctx_s_p_fall,
+            gmres_Jvo,
+            n_species,
+            thermo_coef_low, thermo_coef_high, thermo_Tmid,
+            n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
+            e_react_idx, e_react_sto, e_react_offset,
+            e_prod_idx, e_prod_sto, e_prod_offset,
+            e_idx_r_scatter, e_idx_p_scatter,
+            n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
+            tb_react_idx, tb_react_sto, tb_react_offset,
+            tb_prod_idx, tb_prod_sto, tb_prod_offset,
+            tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
+            n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
+            fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
+            fall_oneWay, fall_delta_n,
+            fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
+            fall_react_idx, fall_react_sto, fall_react_offset,
+            fall_prod_idx, fall_prod_sto, fall_prod_offset,
+            fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
+        )
+        _adiabatic_jvp_TC(
+            T_loc, C_loc, v_T, gmres_vC,
+            omega_loc, gmres_Jvo,
+            n_species,
+            thermo_coef_low, thermo_coef_high, thermo_Tmid,
+            gmres_w,
+        )
+        res_true = float64(0.0)
+        for i in range(n_state):
+            ri = rhs[i] - (dx[i] - h * gmres_w[i])
+            res_true += ri * ri
+        res_true = math.sqrt(res_true)
+
+        if res_true < gmres_tol or j_converged < R:
+            return total_krylov
+
+        beta = res_true
+
+    return total_krylov
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Row load / store helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -281,17 +566,17 @@ def _store_row(src1d, dst2d, row, n):
 def backward_euler_per_thread_kernel(
     TC_in, TC_out,
     h_arr, t_arr,
-    # Newton / LU
     buf_J, buf_LU, buf_piv,
     buf_F, buf_dx, buf_xk, buf_omega,
-    # GMRES global buffers — shape (B, stride); dummies must be (B, 1) not (1,)
-    buf_gmres_V,    # (B, (R+1)*N)
-    buf_gmres_H,    # (B, (R+1)*R)
-    buf_gmres_cs,   # (B, R)
-    buf_gmres_sn,   # (B, R)
-    buf_gmres_g,    # (B, R+1)
-    buf_gmres_w,    # (B, N)
-    buf_gmres_y,    # (B, R)
+    buf_gmres_V,
+    buf_gmres_H,
+    buf_gmres_cs,
+    buf_gmres_sn,
+    buf_gmres_g,
+    buf_gmres_w,
+    buf_gmres_y,
+    buf_gmres_vC,
+    buf_gmres_Jvo,
     # Context – elementary
     buf_ctx_kf_e, buf_ctx_Kc_e,
     buf_ctx_conc_r_e, buf_ctx_conc_p_e, buf_ctx_RR_e,
@@ -311,18 +596,17 @@ def backward_euler_per_thread_kernel(
     buf_ctx_f1_fall,  buf_ctx_exp_fall,
     buf_ctx_dG0_fall, buf_ctx_sr_fall,  buf_ctx_sp_fall,
     converged,
-    # Solver parameters
     newton_tol,
     newton_maxiter,
     reuse_jacobian,
-    linear_solver,      # int32: 0=LU  1=GMRES
-    gmres_restart,      # int32
-    gmres_tol,          # float64
-    gmres_maxiter,      # int32
-    # Timing
-    buf_timers,         # (B, N_TIMER_PHASES) int64 — accumulated cycle counts
-    do_timing,          # int32: 0=off  1=on
-    # Mechanism
+    linear_solver,
+    gmres_restart,
+    gmres_tol,
+    gmres_maxiter,
+    buf_timers,
+    do_timing,
+    buf_iters,     # (B, 2) int32 — divergence counters; dummy (B,1) if do_count=0
+    do_count,      # int32  0=off  1=on
     n_species,
     thermo_coef_low, thermo_coef_high, thermo_Tmid,
     n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
@@ -349,7 +633,6 @@ def backward_euler_per_thread_kernel(
     n_state = n_species + 1
     h = h_arr[b]
 
-    # ── Thread-local working arrays (small, fixed size MAX_N_STATE) ───────
     xk_loc    = cuda.local.array(MAX_N_STATE, dtype=float64)
     C_loc     = cuda.local.array(MAX_N_STATE, dtype=float64)
     omega_loc = cuda.local.array(MAX_N_STATE, dtype=float64)
@@ -358,9 +641,6 @@ def backward_euler_per_thread_kernel(
     dx_loc    = cuda.local.array(MAX_N_STATE, dtype=float64)
     F_loc     = cuda.local.array(MAX_N_STATE, dtype=float64)
 
-    # ── Accumulated per-phase cycle counts (initialised to 0 by integrator) ──
-    # We accumulate locally and write to global once at the end to minimise
-    # global-memory traffic.
     t_pred      = numba.int64(0)
     t_rhs       = numba.int64(0)
     t_res       = numba.int64(0)
@@ -369,7 +649,10 @@ def backward_euler_per_thread_kernel(
     t_lin_solve = numba.int64(0)
     t_update    = numba.int64(0)
 
-    # ── Load x0 ──────────────────────────────────────────────────────────
+    # ── Divergence counters ───────────────────────────────────────────────
+    n_newton_count = int32(0)
+    n_krylov_count = int32(0)
+
     for i in range(n_state):
         xk_loc[i] = TC_in[b, i]
 
@@ -440,7 +723,6 @@ def backward_euler_per_thread_kernel(
         for s in range(n_species):
             C_loc[s] = xk_loc[s + 1]
 
-        # ── RHS + context ─────────────────────────────────────────────────
         if do_timing:
             t0 = cuda_clock64()
 
@@ -489,7 +771,6 @@ def backward_euler_per_thread_kernel(
         if do_timing:
             t_rhs += cuda_clock64() - t0
 
-        # ── Residual F = xk − x0 − h·f(xk) ──────────────────────────────
         if do_timing:
             t0 = cuda_clock64()
 
@@ -507,14 +788,82 @@ def backward_euler_per_thread_kernel(
             converged[b] = int32(1)
             break
 
-        # ── Jacobian assembly ─────────────────────────────────────────────
-        if jacobian_valid == 0 or reuse_jacobian == 0:
-            if do_timing:
-                t0 = cuda_clock64()
+        # ── Count Newton iterations ───────────────────────────────────────
+        n_newton_count += int32(1)
 
-            _assemble_jacobian(
-                T_loc, C_loc, h, n_state,
-                omega_loc,
+        for i in range(n_state):
+            neg_F_loc[i] = -F_loc[i]
+
+        if linear_solver == 0:
+            if jacobian_valid == 0 or reuse_jacobian == 0:
+                if do_timing:
+                    t0 = cuda_clock64()
+
+                _assemble_jacobian(
+                    T_loc, C_loc, h, n_state,
+                    omega_loc,
+                    buf_ctx_kf_e[b],  buf_ctx_Kc_e[b],
+                    buf_ctx_conc_r_e[b], buf_ctx_conc_p_e[b],
+                    buf_ctx_dG0_e[b], buf_ctx_sr_e[b], buf_ctx_sp_e[b],
+                    buf_ctx_kf_tb[b],  buf_ctx_Kc_tb[b],
+                    buf_ctx_cr_tb[b],  buf_ctx_cp_tb[b],
+                    buf_ctx_bRR_tb[b], buf_ctx_M_tb[b],
+                    buf_ctx_dG0_tb[b], buf_ctx_sr_tb[b], buf_ctx_sp_tb[b],
+                    buf_ctx_kf_fall[b], buf_ctx_Kc_fall[b],
+                    buf_ctx_cr_fall[b], buf_ctx_cp_fall[b],
+                    buf_ctx_k0_fall[b], buf_ctx_kinf_fall[b], buf_ctx_M_fall[b],
+                    buf_ctx_Pr_fall[b], buf_ctx_F_fall[b],  buf_ctx_kb_fall[b],
+                    buf_ctx_Fc_fall[b], buf_ctx_lFc_fall[b],
+                    buf_ctx_Cp_fall[b], buf_ctx_Np_fall[b],
+                    buf_ctx_f1_fall[b], buf_ctx_exp_fall[b],
+                    buf_ctx_dG0_fall[b], buf_ctx_sr_fall[b], buf_ctx_sp_fall[b],
+                    buf_J[b],
+                    n_species,
+                    thermo_coef_low, thermo_coef_high, thermo_Tmid,
+                    n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
+                    e_react_idx, e_react_sto, e_react_offset,
+                    e_prod_idx, e_prod_sto, e_prod_offset,
+                    e_idx_r_scatter, e_idx_p_scatter,
+                    n_tb, tb_A, tb_n, tb_Ea, tb_oneWay, tb_delta_n,
+                    tb_react_idx, tb_react_sto, tb_react_offset,
+                    tb_prod_idx, tb_prod_sto, tb_prod_offset,
+                    tb_idx_r_scatter, tb_idx_p_scatter, tb_eff_matrix,
+                    n_fall, fall_A_k0, fall_b_k0, fall_Ea_k0,
+                    fall_A_kinf, fall_b_kinf, fall_Ea_kinf,
+                    fall_oneWay, fall_delta_n,
+                    fall_troe_A, fall_troe_T1, fall_troe_T2, fall_troe_T3, fall_is_troe,
+                    fall_react_idx, fall_react_sto, fall_react_offset,
+                    fall_prod_idx, fall_prod_sto, fall_prod_offset,
+                    fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
+                )
+
+                if do_timing:
+                    t_jac += cuda_clock64() - t0
+
+                if do_timing:
+                    t0 = cuda_clock64()
+                for i in range(n_state * n_state):
+                    buf_LU[b, i] = buf_J[b, i]
+                _lu_factor_inplace(buf_LU[b], buf_piv[b], n_state)
+                if do_timing:
+                    t_lu_fac += cuda_clock64() - t0
+
+                jacobian_valid = int32(1)
+
+        if do_timing:
+            t0 = cuda_clock64()
+
+        if linear_solver == 0:
+            _lu_solve(buf_LU[b], buf_piv[b], neg_F_loc, dx_loc, n_state)
+
+        else:
+            for i in range(n_state):
+                dx_loc[i]    = float64(0.0)
+                buf_dx[b, i] = float64(0.0)
+
+            # ── Accumulate Krylov count from return value ─────────────────
+            n_krylov_count += _gmres_jvp_device(
+                T_loc, C_loc, h,
                 buf_ctx_kf_e[b],  buf_ctx_Kc_e[b],
                 buf_ctx_conc_r_e[b], buf_ctx_conc_p_e[b],
                 buf_ctx_dG0_e[b], buf_ctx_sr_e[b], buf_ctx_sp_e[b],
@@ -530,7 +879,7 @@ def backward_euler_per_thread_kernel(
                 buf_ctx_Cp_fall[b], buf_ctx_Np_fall[b],
                 buf_ctx_f1_fall[b], buf_ctx_exp_fall[b],
                 buf_ctx_dG0_fall[b], buf_ctx_sr_fall[b], buf_ctx_sp_fall[b],
-                buf_J[b],
+                omega_loc,
                 n_species,
                 thermo_coef_low, thermo_coef_high, thermo_Tmid,
                 n_e, e_A, e_n, e_Ea, e_oneWay, e_delta_n,
@@ -548,42 +897,6 @@ def backward_euler_per_thread_kernel(
                 fall_react_idx, fall_react_sto, fall_react_offset,
                 fall_prod_idx, fall_prod_sto, fall_prod_offset,
                 fall_idx_r_scatter, fall_idx_p_scatter, fall_eff_matrix,
-            )
-
-            if do_timing:
-                t_jac += cuda_clock64() - t0
-
-            # LU path: factorise J once per Jacobian assembly
-            if linear_solver == 0:
-                if do_timing:
-                    t0 = cuda_clock64()
-                for i in range(n_state * n_state):
-                    buf_LU[b, i] = buf_J[b, i]
-                _lu_factor_inplace(buf_LU[b], buf_piv[b], n_state)
-                if do_timing:
-                    t_lu_fac += cuda_clock64() - t0
-
-            jacobian_valid = int32(1)
-
-        # ── Linear solve  J·dx = −F ───────────────────────────────────────
-        for i in range(n_state):
-            neg_F_loc[i] = -F_loc[i]
-
-        if do_timing:
-            t0 = cuda_clock64()
-
-        if linear_solver == 0:
-            # LU back-substitution
-            _lu_solve(buf_LU[b], buf_piv[b], neg_F_loc, dx_loc, n_state)
-
-        else:
-            # GMRES — zero dx in global buffer, then call device function
-            for i in range(n_state):
-                dx_loc[i]    = float64(0.0)
-                buf_dx[b, i] = float64(0.0)
-
-            _gmres_givens_device(
-                buf_J[b],
                 neg_F_loc,
                 buf_dx[b],
                 buf_gmres_V[b],
@@ -593,6 +906,8 @@ def backward_euler_per_thread_kernel(
                 buf_gmres_g[b],
                 buf_gmres_w[b],
                 buf_gmres_y[b],
+                buf_gmres_vC[b],
+                buf_gmres_Jvo[b],
                 n_state,
                 gmres_restart,
                 gmres_tol,
@@ -604,7 +919,6 @@ def backward_euler_per_thread_kernel(
         if do_timing:
             t_lin_solve += cuda_clock64() - t0
 
-        # ── Update xk ─────────────────────────────────────────────────────
         if do_timing:
             t0 = cuda_clock64()
 
@@ -623,8 +937,12 @@ def backward_euler_per_thread_kernel(
     for i in range(n_state):
         TC_out[b, i] = xk_loc[i]
 
-    # ── Flush accumulated cycle counts to global memory ───────────────────
-    # One coalesced write of 7 int64 words per thread at the very end.
+    # ── Flush divergence counters ─────────────────────────────────────────
+    if do_count:
+        buf_iters[b, 0] = n_newton_count
+        buf_iters[b, 1] = n_krylov_count
+
+    # ── Flush timer counts ────────────────────────────────────────────────
     if do_timing:
         buf_timers[b, 0] += t_pred
         buf_timers[b, 1] += t_rhs

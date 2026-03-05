@@ -85,7 +85,7 @@ def main():
 
     if HAS_CANTERA:
         gas_ref = ct.Solution(yaml_file)
-    T0s = np.random.uniform(1600.0, 1800.0, n_reactors)
+    T0s = np.random.uniform(1800.0, 2000.0, n_reactors)
     phis = np.random.uniform(0.5, 1.5, n_reactors)
     C0s = np.zeros((n_reactors, mech.n_species), dtype=dtype)
 
