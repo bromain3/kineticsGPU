@@ -119,7 +119,8 @@ def main():
 
     print(f"\nIntegrating {n_reactors} reactors for {n_steps} steps (h={h:.1e} s)...")
     t_start = time.perf_counter()
-    TC_hist, t_hist, conv_hist = integrator.integrate(TC0, t0, t_end, h, save_every=10)
+    TC_hist, t_hist, conv_hist = integrator.integrate(TC0, t0, t_end, h, save_every=10, do_timing=True)
+    integrator.print_timers(n_steps=int(t_end / h))
     t_elapsed = time.perf_counter() - t_start
 
     print(f"  Wall time: {t_elapsed:.3f} s")
