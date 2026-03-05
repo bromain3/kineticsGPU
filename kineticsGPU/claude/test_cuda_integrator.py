@@ -156,9 +156,72 @@ def main():
             print(f"    {sp_names[idx]:10s}: Cantera={C_ref[idx]:.4e}  GPU={C_gpu[idx]:.4e}  "
                   f"err={abs(C_gpu[idx]-C_ref[idx])/(abs(C_ref[idx])+1e-30):.2e}")
 
+        # ── Trajectory plot ───────────────────────────────────────────────
+        print("\nCollecting Cantera trajectory for reactor 0...")
+        t_ct, T_ct, C_ct = run_cantera_trajectory(T0s[0], C0s[0], t_end, h * 10)
+
+        # GPU trajectory: TC_hist shape is (n_saved, n_reactors, n_state)
+        t_gpu_traj = np.array(t_hist)          # (n_saved,)
+        T_gpu_traj = TC_hist[:, 0, 0]          # (n_saved,)  reactor 0, temperature
+        C_gpu_traj = TC_hist[:, 0, 1:]         # (n_saved, n_species)
+
+        # Pick species to plot: top-4 by final Cantera concentration
+        top4_sp = np.argsort(C_ref)[-4:][::-1]
+
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1 + len(top4_sp), 1,
+                                 figsize=(9, 3 * (1 + len(top4_sp))),
+                                 sharex=True)
+
+        # Temperature
+        ax = axes[0]
+        ax.plot(t_ct  * 1e3, T_ct,       'k-',  lw=1.5, label='Cantera')
+        ax.plot(t_gpu_traj * 1e3, T_gpu_traj, 'r--', lw=1.5, label='CUDA GPU')
+        ax.set_ylabel('T (K)')
+        ax.legend(loc='best')
+        ax.set_title('Reactor 0 — temperature & species trajectories')
+
+        # Species
+        for ax, idx in zip(axes[1:], top4_sp):
+            name = sp_names[idx]
+            ax.plot(t_ct  * 1e3, C_ct[:, idx],       'k-',  lw=1.5, label='Cantera')
+            ax.plot(t_gpu_traj * 1e3, C_gpu_traj[:, idx], 'r--', lw=1.5, label='CUDA GPU')
+            ax.set_ylabel(f'[{name}] (mol/m³)')
+            ax.legend(loc='best')
+
+        axes[-1].set_xlabel('Time (ms)')
+        fig.tight_layout()
+        plt.savefig('trajectory_comparison.png', dpi=150)
+        print("  Plot saved to trajectory_comparison.png")
+        plt.show()
+
     print("\n" + "=" * 70)
     print("Test complete.")
 
+
+def run_cantera_trajectory(T0, C0, t_end, dt):
+    """Return full time trajectory for a single reactor."""
+    gas = ct.Solution('gri30.yaml')
+    gas.TP = float(T0), 101325.0
+    gas.concentrations = C0 / 1e3
+
+    r = ct.IdealGasReactor(gas, energy='on')
+    sim = ct.ReactorNet([r])
+
+    t = 0.0
+    times = []
+    T_hist = []
+    C_hist = []
+
+    while t < t_end:
+        t += dt
+        sim.advance(t)
+
+        times.append(t)
+        T_hist.append(r.T)
+        C_hist.append(np.array(r.thermo.concentrations) * 1e3)
+
+    return np.array(times), np.array(T_hist), np.array(C_hist)
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
