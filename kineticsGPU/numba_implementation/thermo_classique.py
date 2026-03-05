@@ -171,6 +171,27 @@ class ThermoData_vectorized:
         #Y: (ncells, nspecies)
         return self.cp_mix(T, Y) - self.R_spec_from_Y(Y)  # relation Cp-Cv = Rspec
 
+    def cp_mol(self, T): #TODO: factorize code for having molar and mass quantities with everyone based on molar
+        """
+        Capacité calorifique molaire moyenne du mélange (J/mol/K)
+
+        Args:
+            T : (ncells,)
+
+        Returns:
+            cp_mol : (ncells,), J/mol/K
+        """
+        T = T[:, None]  # (ncells, 1)
+        coef = self._select_coef(T)[:, :, :5]  # (ncells, nspecies, 5)
+        T_2 = T * T
+        T_3 = T_2 * T
+        T_4 = T_3 * T
+        Temp = torch.stack(
+            [torch.ones_like(T), T, T_2, T_3, T_4], dim=-1
+        )  # (ncells, 1, 5)
+        cp_species_molar = R * torch.sum(coef * Temp, dim=-1)  # (ncells, nspecies)
+        return cp_species_molar  # (ncells,)
+
 
     def cp_mix_mol(self, T, X): #TODO: factorize code for having molar and mass quantities with everyone based on molar
         """
@@ -233,6 +254,26 @@ class ThermoData_vectorized:
 
         h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)  # (ncells, nspecies), J/mol
         return torch.sum(Y * h_species_molar, dim=1)
+
+    def u_mol(self, T):
+        # T : (ncells,)
+
+        T = T[:, None]
+        coef = self._select_coef(T)[:, :, :6]  # (ncells, nspecies, 6)
+
+        T_2 = T * T
+        T_3 = T_2 * T
+        T_4 = T_3 * T
+        Temp = torch.stack([torch.ones_like(T), T / 2, T_2 / 3, T_3 / 4, T_4 / 5, 1 / T], dim=-1)  # (ncells, 1, 6)
+
+        # h_species_molar (J/mol)
+        h_species_molar = R * T * torch.sum(coef * Temp, dim=-1)
+
+        # u = h - R*T  (par espèce)
+        u_species_molar = h_species_molar - R * T  # (ncells, nspecies)
+
+        # mélange
+        return u_species_molar  # (ncells,)
 
     def u_mix_mol(self, T, Y):
         # T : (ncells,)

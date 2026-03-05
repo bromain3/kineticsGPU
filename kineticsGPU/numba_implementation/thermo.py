@@ -177,6 +177,9 @@ def u_nasa7(coef_high, coef_low, T_mid, T):
     """Molar internal energy u = h - RT  (J/mol)."""
     return h_nasa7(coef_high, coef_low, T_mid, T) - constants.R * T
 
+
+# todo: normaly, anithing under this line can be expressed with what is above. the code should not use that as it is redundant
+
 @cuda.jit(device=True, inline=False)
 def h0_nasa7(coefs_high, coefs_low, Tmid, T):
     a = _coefs(coefs_high, coefs_low, Tmid, T)
@@ -207,3 +210,48 @@ def s0_nasa7(coefs_high, coefs_low, Tmid, T):
         + a[4] * 0.25 * T4
         + a[6]
     )
+
+@cuda.jit(device=True, inline=True)
+def cp_mol_sp(coef_high, coef_low, Tmid, sp, T):
+    """
+    cp molaire de l'espèce sp à T (J/mol/K).
+    cp/R = a0 + a1*T + a2*T² + a3*T³ + a4*T⁴
+    """
+    a = _coefs(coef_high[sp], coef_low[sp], Tmid[sp], T)
+    T2 = T * T
+    T3 = T2 * T
+    T4 = T3 * T
+    return constants.R * (a[0] + a[1]*T + a[2]*T2 + a[3]*T3 + a[4]*T4)
+
+@cuda.jit(device=True, inline=True)
+def cv_mol_sp(coef_high, coef_low, Tmid, sp, T):
+    """cv molaire espèce sp (J/mol/K) = cp - R."""
+    return cp_mol_sp(coef_high, coef_low, Tmid, sp, T) - constants.R
+
+@cuda.jit(device=True, inline=True)
+def u_mol_sp(coef_high, coef_low, Tmid, sp, T):
+    """
+    Énergie interne molaire de l'espèce sp à T (J/mol).
+    u = h - R*T
+    h/RT = a0 + a1/2*T + a2/3*T² + a3/4*T³ + a4/5*T⁴ + a5/T
+    → h = R*T*(a0 + a1/2*T + a2/3*T² + a3/4*T³ + a4/5*T⁴) + R*a5
+    → u = h - R*T
+    """
+    a = _coefs(coef_high[sp], coef_low[sp], Tmid[sp], T)
+    T2 = T * T
+    T3 = T2 * T
+    T4 = T3 * T
+    h_over_RT = a[0] + a[1]/2.0*T + a[2]/3.0*T2 + a[3]/4.0*T3 + a[4]/5.0*T4 + a[5]/T
+    h_mol = constants.R * T * h_over_RT
+    u_mol = h_mol - constants.R * T
+    return u_mol
+
+@cuda.jit(device=True, inline=True)
+def dcv_mol_sp_dT(coef_high, coef_low, Tmid, sp, T):
+    """
+    dcv/dT = dcp/dT (J/mol/K²).
+    dcp/R/dT = a1 + 2*a2*T + 3*a3*T² + 4*a4*T³
+    """
+    a  = _coefs(coef_high[sp], coef_low[sp], Tmid[sp], T)
+    T2 = T * T;  T3 = T2 * T
+    return constants.R * (a[1] + 2.0*a[2]*T + 3.0*a[3]*T2 + 4.0*a[4]*T3)
