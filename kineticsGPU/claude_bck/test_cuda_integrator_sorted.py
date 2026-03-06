@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import kineticsGPU.thermo as yaml_thermo
 from kineticsGPU.reactionParser import parseReactions, build_reactions
-from kineticsGPU.claude.mechanism.mechanism_data import build_mechanism_data_from_torch
-from kineticsGPU.claude.integrator.cuda_integrator import CUDABackwardEulerIntegrator
+from kineticsGPU.claude_bck.mechanism.mechanism_data import build_mechanism_data_from_torch
+from kineticsGPU.claude_bck.integrator.cuda_integrator import CUDABackwardEulerIntegrator
 
 try:
     import cantera as ct

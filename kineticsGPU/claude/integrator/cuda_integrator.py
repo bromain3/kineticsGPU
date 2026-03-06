@@ -1,170 +1,85 @@
 """
-CUDABackwardEulerIntegrator — v5 (LU + GMRES + timing)
+cuda_integrator.py — Production backward-Euler integrator (GMRES only).
 
-Perf fixes vs v4
-────────────────
-• Point 2 — élimination des copies CPU→GPU dans la boucle chaude :
-    - h_arr  : copié une seule fois dans integrate() si h est constant,
-               et uniquement si h_eff change (dernier pas tronqué).
-    - t_arr  : plus jamais copié — le kernel n'en a pas besoin pour le calcul
-               (t ne sert pas dans la physique, seulement pour du logging).
-               Le buffer _d_t_arr est supprimé.
-    - conv   : zeroed sur device via un petit kernel dédié (_zero_int_kernel)
-               au lieu d'allouer np.zeros + copy_to_device à chaque pas.
-    - Les buffers h_host et conv_zeros sont pré-alloués une fois dans __init__.
-
-• Point 3 — copies device→host limitées :
-    - Les snapshots demandés par save_every sont accumulés dans un buffer
-      device pré-alloué  _d_TC_hist  (n_saves, B, N_state)  et
-      _d_conv_hist  (n_saves, B).
-    - Un kernel _store_snapshot_kernel copie TC_a et conv dans ce buffer.
-    - Une seule paire copy_to_host() à la fin de integrate() transfère
-      tout l'historique en un seul appel.
-    - t_hist reste une simple liste Python (pas de transfer GPU).
+vs original v5:
+  - No LU path, no timing, no reuse_jacobian, no dead branches.
+  - h passed as float64 scalar — no per-step _d_h_arr fill kernel.
+  - conv zeroed via lightweight device kernel (same as v5).
+  - Context buffers (buf_ctx_*) kept in global memory — same as v5,
+    avoids register spilling that would happen with local arrays.
+  - Snapshots accumulated in pre-allocated device buffer, single
+    copy_to_host at end of integrate() — same as v5.
+  - _d_J, _d_LU, _d_piv, _d_F, _d_dx, _d_xk, _d_omega removed
+    (those were only needed for the LU path).
 """
 
 import math
 import numpy as np
 import numba.cuda as cuda
-from numba.cuda import get_current_device
-from numba import cuda as nb_cuda, int32, float64
+from numba import int32
 import time
 
 from ..mechanism.mechanism_data import MechanismData
-from ..kernels.integrator_kernel import (
-    backward_euler_per_thread_kernel,
-    N_TIMER_PHASES,
-    _T_PREDICTOR, _T_RHS, _T_RESIDUAL, _T_JAC_ASSEM,
-    _T_LU_FACTOR, _T_LINEAR_SOLVE, _T_UPDATE,
+from ..kernels.chemistry_kernels import (
+    backward_euler_kernel,
+    _fill_int_zero,
+    _store_snapshot,
+    MAX_N_STATE,
+    THREADS_PER_BLOCK,
 )
 
-THREADS_PER_BLOCK = 64
-
-_PHASE_NAMES = [
-    "PREDICTOR ",
-    "RHS       ",
-    "RESIDUAL  ",
-    "JAC_ASSEM ",
-    "LU_FACTOR ",
-    "LIN_SOLVE ",
-    "UPDATE    ",
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helper kernels  (device-side utilities, launched once per step or snapshot)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@nb_cuda.jit
-def _zero_int_kernel(arr):
-    """Zero a 1-D int32 array in-place on device — avoids CPU allocation."""
-    i = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
-    if i < arr.shape[0]:
-        arr[i] = int32(0)
-
-
-@nb_cuda.jit
-def _fill_float_kernel(arr, val):
-    """Fill a 1-D float array with val on device — used to broadcast h_eff."""
-    i = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
-    if i < arr.shape[0]:
-        arr[i] = val
-
-
-@nb_cuda.jit
-def _store_snapshot_kernel(TC_src, conv_src, TC_hist, conv_hist, snap_idx):
-    """
-    Copy one row of TC_src (B, N_state) and conv_src (B,) into the
-    pre-allocated history buffers at position snap_idx.
-    One thread per reactor.
-    """
-    b = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
-    if b >= TC_src.shape[0]:
-        return
-    n_state = TC_src.shape[1]
-    for i in range(n_state):
-        TC_hist[snap_idx, b, i] = TC_src[b, i]
-    conv_hist[snap_idx, b] = conv_src[b]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main integrator class
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CUDABackwardEulerIntegrator:
     """
-    Per-thread backward Euler integrator for batched chemical reactors.
+    Per-thread backward-Euler integrator for batched adiabatic reactors.
 
     Parameters
     ----------
-    mechanism : MechanismData
-    n_reactors : int
-    newton_tol : float
-    newton_maxiter : int
-    reuse_jacobian : bool
-    linear_solver : str
-        'lu'    — dense LU (exact, O(N³) factor cost)
-        'gmres' — restarted GMRES with Givens rotations
-    gmres_restart : int
-    gmres_tol : float
-    gmres_maxiter : int
-    dtype : np.dtype
+    mechanism      : MechanismData
+    n_reactors     : int
+    newton_tol     : float   (default 1e-6)
+    newton_maxiter : int     (default 20)
+    gmres_restart  : int     (default 20)
+    gmres_tol      : float   (default 1e-6)
+    gmres_maxiter  : int     (default 50)
+    dtype          : numpy dtype (default float64)
     """
-
-    _SOLVER_MAP = {'lu': 0, 'gmres': 1}
 
     def __init__(
         self,
         mechanism: MechanismData,
         n_reactors: int,
-        newton_tol: float = 1e-6,
+        newton_tol: float   = 1e-6,
         newton_maxiter: int = 20,
-        reuse_jacobian: bool = True,
-        linear_solver: str = 'gmres',
-        gmres_restart: int = 20,
-        gmres_tol: float = 1e-6,
-        gmres_maxiter: int = 50,
-        dtype=np.float64,
+        gmres_restart: int  = 20,
+        gmres_tol: float    = 1e-6,
+        gmres_maxiter: int  = 50,
+        dtype               = np.float64,
     ):
-        if linear_solver not in self._SOLVER_MAP:
-            raise ValueError(
-                f"linear_solver must be 'lu' or 'gmres', got '{linear_solver}'"
-            )
+        self.mech           = mechanism
+        self.B              = n_reactors
+        self.N_s            = mechanism.n_species
+        self.N_state        = mechanism.n_species + 1
+        self.newton_tol     = float(newton_tol)
+        self.newton_maxiter = int(newton_maxiter)
+        self.gmres_restart  = int(gmres_restart)
+        self.gmres_tol      = float(gmres_tol)
+        self.gmres_maxiter  = int(gmres_maxiter)
+        self.dtype          = dtype
 
-        self.mech            = mechanism
-        self.B               = n_reactors
-        self.N_s             = mechanism.n_species
-        self.N_state         = mechanism.n_species + 1
-        self.newton_tol      = newton_tol
-        self.newton_maxiter  = newton_maxiter
-        self.reuse_jac       = int(reuse_jacobian)
-        self.linear_solver   = self._SOLVER_MAP[linear_solver]
-        self.gmres_restart   = int(gmres_restart)
-        self.gmres_tol       = float(gmres_tol)
-        self.gmres_maxiter   = int(gmres_maxiter)
-        self.dtype           = dtype
-
-        self._clock_khz = get_current_device().CLOCK_RATE
         self._d_mech = mechanism.to_cuda_arrays()
         self._alloc_buffers()
         self._mech_args = self._pack_mech_args()
 
-        # ── Pré-allocation des buffers hôte réutilisés dans la boucle ────
-        # Évite numpy allocations répétées dans step()
-        self._h_host    = np.empty(n_reactors, dtype=dtype)   # pour h_arr
-        self._h_current = None   # dernière valeur broadcastée dans _d_h_arr
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  Buffer allocation
     # ─────────────────────────────────────────────────────────────────────
 
     def _alloc_buffers(self):
-        B   = self.B
-        Ns  = self.N_s
-        Nst = self.N_state
-        mech = self.mech
-        dt   = self.dtype
+        B    = self.B
+        Nst  = self.N_state
+        Ns   = self.N_s
         R    = self.gmres_restart
+        dt   = self.dtype
+        mech = self.mech
 
         e    = mech.elementary
         tb   = mech.threebody
@@ -172,205 +87,105 @@ class CUDABackwardEulerIntegrator:
 
         n_e       = e.n_reactions    if e    else 0
         n_tb      = tb.n_reactions   if tb   else 0
-        n_fall    = fall.n_reactions if fall else 0
+        n_f       = fall.n_reactions if fall else 0
         n_tr_e    = len(e.react_idx)    if e    else 0
         n_tp_e    = len(e.prod_idx)     if e    else 0
         n_tr_tb   = len(tb.react_idx)   if tb   else 0
         n_tp_tb   = len(tb.prod_idx)    if tb   else 0
-        n_tr_fall = len(fall.react_idx) if fall else 0
-        n_tp_fall = len(fall.prod_idx)  if fall else 0
+        n_tr_f    = len(fall.react_idx) if fall else 0
+        n_tp_f    = len(fall.prod_idx)  if fall else 0
 
-        def buf(shape):  return cuda.device_array(shape, dtype=dt)
-        def ibuf(shape): return cuda.device_array(shape, dtype=np.int32)
-        def dummy2d():   return cuda.device_array((B, 1), dtype=dt)
+        def _buf(shape):  return cuda.device_array(shape, dtype=dt)
+        def _ibuf(shape): return cuda.device_array(shape, dtype=np.int32)
+        def _d1():        return _buf((B, 1))  # dummy placeholder
 
-        # ── Ping-pong state ───────────────────────────────────────────────
-        self._d_TC_a  = buf((B, Nst))
-        self._d_TC_b  = buf((B, Nst))
+        # Ping-pong state
+        self._d_TC_a = _buf((B, Nst))
+        self._d_TC_b = _buf((B, Nst))
 
-        # ── h_arr : alloué une fois, mis à jour seulement si h change ────
-        # t_arr : SUPPRIMÉ — le kernel n'utilise pas t pour la physique.
-        self._d_h_arr = buf((B,))
+        # Convergence flag
+        self._d_conv = _ibuf((B,))
 
-        # ── conv : buffer device permanent, zeroé via kernel ─────────────
-        self._d_conv  = ibuf((B,))
+        # GMRES scratch
+        self._d_gm_V  = _buf((B, (R+1)*Nst))
+        self._d_gm_H  = _buf((B, (R+1)*R))
+        self._d_gm_cs = _buf((B, R))
+        self._d_gm_sn = _buf((B, R))
+        self._d_gm_g  = _buf((B, R+1))
+        self._d_gm_w  = _buf((B, Nst))
+        self._d_gm_y  = _buf((B, R))
 
-        # ── Newton / LU ───────────────────────────────────────────────────
-        self._d_J     = buf((B, Nst * Nst))
-        self._d_LU    = buf((B, Nst * Nst))
-        self._d_piv   = ibuf((B, Nst))
-        self._d_F     = buf((B, Nst))
-        self._d_dx    = buf((B, Nst))
-        self._d_xk    = buf((B, Nst))
-        self._d_omega = buf((B, Ns))
+        # Chemistry context buffers (global memory, per-reactor rows)
+        def _ce(n):  return _buf((B, n)) if n > 0 else _d1()
+        def _cef(n): return _buf((B, n)) if n > 0 else _d1()
 
-        # ── GMRES ─────────────────────────────────────────────────────────
-        if self.linear_solver == 1:
-            self._d_gmres_V   = buf((B, (R + 1) * Nst))
-            self._d_gmres_H   = buf((B, (R + 1) * R))
-            self._d_gmres_cs  = buf((B, R))
-            self._d_gmres_sn  = buf((B, R))
-            self._d_gmres_g   = buf((B, R + 1))
-            self._d_gmres_w   = buf((B, Nst))
-            self._d_gmres_y   = buf((B, R))
-            self._d_gmres_vC  = buf((B, Nst))
-            self._d_gmres_Jvo = buf((B, Nst))
-        else:
-            self._d_gmres_V   = dummy2d()
-            self._d_gmres_H   = dummy2d()
-            self._d_gmres_cs  = dummy2d()
-            self._d_gmres_sn  = dummy2d()
-            self._d_gmres_g   = dummy2d()
-            self._d_gmres_w   = dummy2d()
-            self._d_gmres_y   = dummy2d()
-            self._d_gmres_vC  = dummy2d()
-            self._d_gmres_Jvo = dummy2d()
+        self._ctx_kf_e   = _ce(n_e);    self._ctx_Kc_e   = _ce(n_e)
+        self._ctx_cr_e   = _ce(n_e);    self._ctx_cp_e   = _ce(n_e)
+        self._ctx_dG0_e  = _ce(n_e)
+        self._ctx_sRre   = _ce(n_tr_e); self._ctx_sRpe   = _ce(n_tp_e)
 
-        # ── Timing / counting ─────────────────────────────────────────────
-        self._d_timers = cuda.device_array((B, N_TIMER_PHASES), dtype=np.int64)
-        self._d_timers.copy_to_device(
-            np.zeros((B, N_TIMER_PHASES), dtype=np.int64)
-        )
-        self._d_iters = cuda.device_array((B, 2), dtype=np.int64)
-        self._d_iters.copy_to_device(np.zeros((B, 2), dtype=np.int64))
+        self._ctx_kf_tb  = _ce(n_tb);   self._ctx_Kc_tb  = _ce(n_tb)
+        self._ctx_cr_tb  = _ce(n_tb);   self._ctx_cp_tb  = _ce(n_tb)
+        self._ctx_dG0_tb = _ce(n_tb)
+        self._ctx_sRrtb  = _ce(n_tr_tb);self._ctx_sRptb  = _ce(n_tp_tb)
+        self._ctx_bRR_tb = _ce(n_tb);   self._ctx_M_tb   = _ce(n_tb)
 
-        # ── Chemistry context ─────────────────────────────────────────────
-        self._d_ctx_kf_e    = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_Kc_e    = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_cr_e    = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_cp_e    = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_RR_e    = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_dG0_e   = buf((B, n_e))     if n_e     else dummy2d()
-        self._d_ctx_sr_e    = buf((B, n_tr_e))  if n_tr_e  else dummy2d()
-        self._d_ctx_sp_e    = buf((B, n_tp_e))  if n_tp_e  else dummy2d()
-
-        self._d_ctx_kf_tb   = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_Kc_tb   = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_cr_tb   = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_cp_tb   = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_RR_tb   = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_bRR_tb  = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_M_tb    = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_dG0_tb  = buf((B, n_tb))    if n_tb    else dummy2d()
-        self._d_ctx_sr_tb   = buf((B, n_tr_tb)) if n_tr_tb else dummy2d()
-        self._d_ctx_sp_tb   = buf((B, n_tp_tb)) if n_tp_tb else dummy2d()
-
-        self._d_ctx_kf_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_Kc_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_cr_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_cp_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_RR_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_k0_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_kinf_fall = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_M_fall    = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_Pr_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_F_fall    = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_kb_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_Fc_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_lFc_fall  = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_Cp_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_Np_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_f1_fall   = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_exp_fall  = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_dG0_fall  = buf((B, n_fall))    if n_fall    else dummy2d()
-        self._d_ctx_sr_fall   = buf((B, n_tr_fall)) if n_tr_fall else dummy2d()
-        self._d_ctx_sp_fall   = buf((B, n_tp_fall)) if n_tp_fall else dummy2d()
+        self._ctx_kf_f   = _cef(n_f);   self._ctx_Kc_f   = _cef(n_f)
+        self._ctx_cr_f   = _cef(n_f);   self._ctx_cp_f   = _cef(n_f)
+        self._ctx_dG0_f  = _cef(n_f)
+        self._ctx_sRrf   = _cef(n_tr_f);self._ctx_sRpf   = _cef(n_tp_f)
+        self._ctx_k0_f   = _cef(n_f);   self._ctx_kinf_f = _cef(n_f)
+        self._ctx_M_f    = _cef(n_f);   self._ctx_Pr_f   = _cef(n_f)
+        self._ctx_F_f    = _cef(n_f);   self._ctx_kb_f   = _cef(n_f)
+        self._ctx_Fc_f   = _cef(n_f);   self._ctx_lFc_f  = _cef(n_f)
+        self._ctx_Cp_f   = _cef(n_f);   self._ctx_Np_f   = _cef(n_f)
+        self._ctx_f1_f   = _cef(n_f);   self._ctx_exp_f  = _cef(n_f)
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Helpers pour lancer les kernels utilitaires
-    # ─────────────────────────────────────────────────────────────────────
 
-    def _blocks_for(self, n):
-        return math.ceil(n / THREADS_PER_BLOCK)
+    def _blocks(self):
+        return math.ceil(self.B / THREADS_PER_BLOCK)
 
     def _zero_conv(self):
-        """Zéroer _d_conv entièrement sur device, sans aucune copie CPU."""
-        _zero_int_kernel[self._blocks_for(self.B), THREADS_PER_BLOCK](
-            self._d_conv
-        )
-
-    def _set_h(self, h_eff: float):
-        """
-        Broadcaster h_eff dans _d_h_arr uniquement si la valeur a changé.
-        Évite un copy_to_device + np.full à chaque pas quand h est constant.
-        """
-        if h_eff != self._h_current:
-            _fill_float_kernel[self._blocks_for(self.B), THREADS_PER_BLOCK](
-                self._d_h_arr, self.dtype(h_eff)
-            )
-            self._h_current = h_eff
+        _fill_int_zero[self._blocks(), THREADS_PER_BLOCK](self._d_conv)
 
     # ─────────────────────────────────────────────────────────────────────
-    #  step()
-    # ─────────────────────────────────────────────────────────────────────
 
-    def step(self, h_eff: float, do_timing: bool = False, do_count: bool = False):
-        """
-        Effectue un pas de backward Euler.
-
-        Paramètre t supprimé : le kernel n'utilise pas t pour la physique.
-        h_eff est broadcasté sur device uniquement s'il a changé depuis le
-        dernier appel (cas du dernier pas tronqué).
-        conv est zéroé via un kernel device (pas de copie CPU).
-        """
-        self._set_h(h_eff)
+    def step(self, h: float):
+        """Single backward-Euler step with step size h."""
         self._zero_conv()
-
-        blocks = self._blocks_for(self.B)
-
-        backward_euler_per_thread_kernel[blocks, THREADS_PER_BLOCK](
+        backward_euler_kernel[self._blocks(), THREADS_PER_BLOCK](
             self._d_TC_a, self._d_TC_b,
-            self._d_h_arr,
-            # Newton / LU
-            self._d_J, self._d_LU, self._d_piv,
-            self._d_F, self._d_dx, self._d_xk, self._d_omega,
-            # GMRES
-            self._d_gmres_V,
-            self._d_gmres_H,
-            self._d_gmres_cs,
-            self._d_gmres_sn,
-            self._d_gmres_g,
-            self._d_gmres_w,
-            self._d_gmres_y,
-            self._d_gmres_vC,
-            self._d_gmres_Jvo,
-            # Context – elementary
-            self._d_ctx_kf_e,   self._d_ctx_Kc_e,
-            self._d_ctx_cr_e,   self._d_ctx_cp_e,  self._d_ctx_RR_e,
-            self._d_ctx_dG0_e,  self._d_ctx_sr_e,  self._d_ctx_sp_e,
-            # Context – three-body
-            self._d_ctx_kf_tb,  self._d_ctx_Kc_tb,
-            self._d_ctx_cr_tb,  self._d_ctx_cp_tb,
-            self._d_ctx_RR_tb,  self._d_ctx_bRR_tb, self._d_ctx_M_tb,
-            self._d_ctx_dG0_tb, self._d_ctx_sr_tb,  self._d_ctx_sp_tb,
-            # Context – falloff
-            self._d_ctx_kf_fall,  self._d_ctx_Kc_fall,
-            self._d_ctx_cr_fall,  self._d_ctx_cp_fall,  self._d_ctx_RR_fall,
-            self._d_ctx_k0_fall,  self._d_ctx_kinf_fall, self._d_ctx_M_fall,
-            self._d_ctx_Pr_fall,  self._d_ctx_F_fall,   self._d_ctx_kb_fall,
-            self._d_ctx_Fc_fall,  self._d_ctx_lFc_fall,
-            self._d_ctx_Cp_fall,  self._d_ctx_Np_fall,
-            self._d_ctx_f1_fall,  self._d_ctx_exp_fall,
-            self._d_ctx_dG0_fall, self._d_ctx_sr_fall,  self._d_ctx_sp_fall,
-            self._d_conv,
-            self.newton_tol,
-            self.newton_maxiter,
-            self.reuse_jac,
-            np.int32(self.linear_solver),
+            self.dtype(h),
+            self.dtype(self.newton_tol),
+            np.int32(self.newton_maxiter),
             np.int32(self.gmres_restart),
-            self.gmres_tol,
+            self.dtype(self.gmres_tol),
             np.int32(self.gmres_maxiter),
-            self._d_timers,
-            np.int32(1 if do_timing else 0),
-            self._d_iters,
-            np.int32(1 if do_count else 0),
+            self._d_conv,
+            # GMRES scratch
+            self._d_gm_V, self._d_gm_H,
+            self._d_gm_cs, self._d_gm_sn, self._d_gm_g,
+            self._d_gm_w, self._d_gm_y,
+            # context buffers
+            self._ctx_kf_e,   self._ctx_Kc_e,  self._ctx_cr_e,
+            self._ctx_cp_e,   self._ctx_dG0_e,
+            self._ctx_sRre,   self._ctx_sRpe,
+            self._ctx_kf_tb,  self._ctx_Kc_tb, self._ctx_cr_tb,
+            self._ctx_cp_tb,  self._ctx_dG0_tb,
+            self._ctx_sRrtb,  self._ctx_sRptb, self._ctx_bRR_tb, self._ctx_M_tb,
+            self._ctx_kf_f,   self._ctx_Kc_f,  self._ctx_cr_f,
+            self._ctx_cp_f,   self._ctx_dG0_f,
+            self._ctx_sRrf,   self._ctx_sRpf,
+            self._ctx_k0_f,   self._ctx_kinf_f, self._ctx_M_f,
+            self._ctx_Pr_f,   self._ctx_F_f,   self._ctx_kb_f,
+            self._ctx_Fc_f,   self._ctx_lFc_f, self._ctx_Cp_f,
+            self._ctx_Np_f,   self._ctx_f1_f,  self._ctx_exp_f,
+            # mechanism
             *self._mech_args,
         )
-
         self._d_TC_a, self._d_TC_b = self._d_TC_b, self._d_TC_a
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  integrate()
     # ─────────────────────────────────────────────────────────────────────
 
     def integrate(
@@ -380,126 +195,62 @@ class CUDABackwardEulerIntegrator:
         t_end: float,
         h: float,
         save_every: int = 1,
-        do_timing: bool = False,
-        do_count: bool = False,
     ):
         """
-        Intègre de t0 à t_end avec pas fixe h.
-
-        Optimisations vs v4 :
-        - h_arr et conv ne sont plus copiés via CPU dans la boucle.
-        - Les snapshots sont écrits dans un buffer device pré-alloué
-          (_d_TC_hist, _d_conv_hist) via un kernel léger.
-        - Une seule paire copy_to_host() est effectuée à la fin.
+        Integrate from t0 to t_end with fixed step h.
 
         Returns
         -------
         TC_hist   : np.ndarray (n_saved, B, n_state)
         t_hist    : np.ndarray (n_saved,)
-        conv_hist : np.ndarray (n_saved, B)
+        conv_hist : np.ndarray (n_saved, B)  int32
         """
         self._d_TC_a.copy_to_device(
             np.ascontiguousarray(TC0, dtype=self.dtype)
         )
 
-        t       = t0
-        n_steps = int(math.ceil((t_end - t0) / h))
-        n_saves = math.ceil(n_steps / save_every)
+        n_steps  = int(math.ceil((t_end - t0) / h))
+        n_saves  = math.ceil(n_steps / save_every)
+        t        = t0
+        snap_idx = 0
+        blk      = self._blocks()
 
-        # ── Allouer les buffers d'historique sur device ───────────────────
-        d_TC_hist   = cuda.device_array(
-            (n_saves, self.B, self.N_state), dtype=self.dtype
-        )
-        d_conv_hist = cuda.device_array(
-            (n_saves, self.B), dtype=np.int32
-        )
-        t_hist_list = []   # liste Python légère, pas de GPU pour les scalaires
+        d_TC_hist   = cuda.device_array((n_saves, self.B, self.N_state), self.dtype)
+        d_conv_hist = cuda.device_array((n_saves, self.B), np.int32)
+        t_list      = []
 
-        snap_idx   = 0
-        blocks_b   = self._blocks_for(self.B)
-
-        wall_timer = 0.0
-
+        t_wall = 0.0
         for step_i in range(n_steps):
             h_eff = min(h, t_end - t)
             if h_eff <= 0.0:
                 break
 
-            wall_timer -= time.perf_counter()
-            self.step(h_eff, do_timing=do_timing, do_count=do_count)
-            wall_timer += time.perf_counter()
+            t_wall -= time.perf_counter()
+            self.step(h_eff)
+            print(t)
+            t_wall += time.perf_counter()
 
             t += h_eff
 
             if step_i % save_every == 0 and snap_idx < n_saves:
-                # Copie device→device via kernel : pas de synchronisation forcée
-                _store_snapshot_kernel[blocks_b, THREADS_PER_BLOCK](
-                    self._d_TC_a,
-                    self._d_conv,
-                    d_TC_hist,
-                    d_conv_hist,
+                _store_snapshot[blk, THREADS_PER_BLOCK](
+                    self._d_TC_a, self._d_conv,
+                    d_TC_hist, d_conv_hist,
                     np.int32(snap_idx),
                 )
-                t_hist_list.append(t)
+                t_list.append(t)
                 snap_idx += 1
 
-        # ── Synchronisation unique + copie hôte en bloc ───────────────────
         cuda.synchronize()
+        TC_hist   = d_TC_hist.copy_to_host()[:snap_idx]
+        conv_hist = d_conv_hist.copy_to_host()[:snap_idx]
+        t_hist    = np.array(t_list)
 
-        TC_hist   = d_TC_hist.copy_to_host()[:snap_idx]     # (n_saved, B, N_state)
-        conv_hist = d_conv_hist.copy_to_host()[:snap_idx]   # (n_saved, B)
-        t_hist    = np.array(t_hist_list)
-
-        print(f'simulation ended in {wall_timer:.4f}s (wall, kernel launches only)')
+        print(f"integrate: {n_steps} steps in {t_wall:.4f}s wall "
+              f"({1e6*t_wall/n_steps:.2f} µs/step, {self.B} reactors)")
 
         return TC_hist, t_hist, conv_hist
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Timing helpers
-    # ─────────────────────────────────────────────────────────────────────
-
-    def reset_timers(self):
-        self._d_timers.copy_to_device(
-            np.zeros((self.B, N_TIMER_PHASES), dtype=np.int64)
-        )
-
-    def get_timers(self) -> np.ndarray:
-        return self._d_timers.copy_to_host()
-
-    def get_timers_us(self) -> np.ndarray:
-        raw = self.get_timers().astype(np.float64)
-        return raw / (self._clock_khz * 1e3)
-
-    def print_timers(self, n_steps: int = 1):
-        us = self.get_timers_us()
-        mean_us  = us.mean(axis=0)
-        max_us   = us.max(axis=0)
-        std_us   = us.std(axis=0)
-        total_us = mean_us.sum()
-
-        solver_name = 'LU' if self.linear_solver == 0 else 'GMRES'
-        print(f"\n{'─'*62}")
-        print(f"  Solver timing summary  [{solver_name}, B={self.B}, steps={n_steps}]")
-        print(f"{'─'*62}")
-        print(f"  {'Phase':<14}  {'Mean(µs)':>10}  {'Max(µs)':>10}  "
-              f"{'Std(µs)':>10}  {'%total':>7}")
-        print(f"{'─'*62}")
-        for ph in range(N_TIMER_PHASES):
-            pct = 100.0 * mean_us[ph] / total_us if total_us > 0 else 0.0
-            print(f"  {_PHASE_NAMES[ph]:<14}  {mean_us[ph]:>10.2f}  "
-                  f"{max_us[ph]:>10.2f}  {std_us[ph]:>10.2f}  {pct:>6.1f}%")
-        print(f"{'─'*62}")
-        print(f"  {'TOTAL':<14}  {total_us:>10.2f}")
-        print(f"{'─'*62}\n")
-
-        if n_steps > 1:
-            print(f"  Per-step averages (÷{n_steps}):")
-            for ph in range(N_TIMER_PHASES):
-                print(f"    {_PHASE_NAMES[ph]}: {mean_us[ph]/n_steps:.3f} µs")
-            print()
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  _pack_mech_args  (inchangé)
     # ─────────────────────────────────────────────────────────────────────
 
     def _pack_mech_args(self):
@@ -508,46 +259,33 @@ class CUDABackwardEulerIntegrator:
         e  = m.elementary
         tb = m.threebody
         fa = m.falloff
-
-        def _get(key, fs):
-            return d[key] if key in d else cuda.device_array(fs, dtype=self.dtype)
-        def _iget(key, fs):
-            return d[key] if key in d else cuda.device_array(fs, dtype=np.int32)
-
         Ns = self.N_s
+
+        def _g(k):  return d.get(k, cuda.device_array((1,), self.dtype))
+        def _gi(k): return d.get(k, cuda.device_array((1,), np.int32))
+
         return [
             np.int32(Ns),
             d['thermo_coef_low'], d['thermo_coef_high'], d['thermo_Tmid'],
+            # Elementary
             np.int32(e.n_reactions if e else 0),
-            _get('elem_A',(1,)),   _get('elem_n',(1,)),   _get('elem_Ea',(1,)),
-            _get('elem_oneWay',(1,)), _get('elem_delta_n',(1,)),
-            _iget('elem_react_idx',(1,)), _get('elem_react_sto',(1,)),
-            _iget('elem_react_offset',(1,)),
-            _iget('elem_prod_idx',(1,)),  _get('elem_prod_sto',(1,)),
-            _iget('elem_prod_offset',(1,)),
-            _iget('elem_idx_r_scatter',(1,)), _iget('elem_idx_p_scatter',(1,)),
+            _g('e_A'), _g('e_n'), _g('e_Ea'), _g('e_oneWay'), _g('e_delta_n'),
+            _gi('e_react_idx'), _g('e_react_sto'), _gi('e_react_offset'),
+            _gi('e_prod_idx'),  _g('e_prod_sto'),  _gi('e_prod_offset'),
+            # Three-body
             np.int32(tb.n_reactions if tb else 0),
-            _get('tb_A',(1,)),   _get('tb_n',(1,)),   _get('tb_Ea',(1,)),
-            _get('tb_oneWay',(1,)), _get('tb_delta_n',(1,)),
-            _iget('tb_react_idx',(1,)), _get('tb_react_sto',(1,)),
-            _iget('tb_react_offset',(1,)),
-            _iget('tb_prod_idx',(1,)),  _get('tb_prod_sto',(1,)),
-            _iget('tb_prod_offset',(1,)),
-            _iget('tb_idx_r_scatter',(1,)), _iget('tb_idx_p_scatter',(1,)),
-            _get('tb_eff_matrix',(1, Ns)),
+            _g('tb_A'), _g('tb_n'), _g('tb_Ea'), _g('tb_oneWay'), _g('tb_delta_n'),
+            _gi('tb_react_idx'), _g('tb_react_sto'), _gi('tb_react_offset'),
+            _gi('tb_prod_idx'),  _g('tb_prod_sto'),  _gi('tb_prod_offset'),
+            _g('tb_eff_matrix'),
+            # Falloff
             np.int32(fa.n_reactions if fa else 0),
-            _get('fall_A_k0',(1,)),    _get('fall_b_k0',(1,)),
-            _get('fall_Ea_k0',(1,)),
-            _get('fall_A_kinf',(1,)),   _get('fall_b_kinf',(1,)),
-            _get('fall_Ea_kinf',(1,)),
-            _get('fall_oneWay',(1,)),   _get('fall_delta_n',(1,)),
-            _get('fall_troe_A',(1,)),   _get('fall_troe_T1',(1,)),
-            _get('fall_troe_T2',(1,)),  _get('fall_troe_T3',(1,)),
-            _iget('fall_is_troe',(1,)),
-            _iget('fall_react_idx',(1,)), _get('fall_react_sto',(1,)),
-            _iget('fall_react_offset',(1,)),
-            _iget('fall_prod_idx',(1,)),  _get('fall_prod_sto',(1,)),
-            _iget('fall_prod_offset',(1,)),
-            _iget('fall_idx_r_scatter',(1,)), _iget('fall_idx_p_scatter',(1,)),
-            _get('fall_eff_matrix',(1, Ns)),
+            _g('f_A_k0'),  _g('f_b_k0'),  _g('f_Ea_k0'),
+            _g('f_A_kinf'),_g('f_b_kinf'),_g('f_Ea_kinf'),
+            _g('f_oneWay'),_g('f_delta_n'),
+            _g('f_troe_A'),_g('f_troe_T1'),_g('f_troe_T2'),_g('f_troe_T3'),
+            _gi('f_is_troe'),
+            _gi('f_react_idx'), _g('f_react_sto'), _gi('f_react_offset'),
+            _gi('f_prod_idx'),  _g('f_prod_sto'),  _gi('f_prod_offset'),
+            _g('f_eff_matrix'),
         ]
