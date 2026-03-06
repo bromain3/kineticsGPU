@@ -80,7 +80,7 @@ def main():
     print(f"  n_reactions = {mech.n_reactions_total}")
 
     # ── Initial conditions ────────────────────────────────────────────────
-    n_reactors = 1000
+    n_reactors = 1
     print(f"\nSetting up {n_reactors} CH4/air reactors...")
 
     if HAS_CANTERA:
@@ -227,3 +227,6 @@ def run_cantera_trajectory(T0, C0, t_end, dt):
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     main()
+
+    # try fastmath (slightly faster, from 190 to 168 µs of kernel and wall time from 150 to 134
+    # 1 reactor (so no thread divergence) : mean step time of about 190 µs, meaning about 3000 * 190 = 0.57 s of pur kernel time vs 150 s of wall time. so ther is a huuuuuge problem somewhere else. maybe due to thread waiting for one another ?

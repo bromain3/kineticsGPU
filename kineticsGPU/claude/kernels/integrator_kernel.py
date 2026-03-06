@@ -562,7 +562,7 @@ def _store_row(src1d, dst2d, row, n):
 #  Main kernel
 # ─────────────────────────────────────────────────────────────────────────────
 
-@cuda.jit
+@cuda.jit(fastmath=True)
 def backward_euler_per_thread_kernel(
     TC_in, TC_out,
     h_arr, t_arr,

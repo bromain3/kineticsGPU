@@ -35,6 +35,7 @@ import kineticsGPU.thermo as yaml_thermo
 from kineticsGPU.reactionParser import parseReactions, build_reactions
 from kineticsGPU.claude.mechanism.mechanism_data import build_mechanism_data_from_torch
 from kineticsGPU.claude.integrator.cuda_integrator import CUDABackwardEulerIntegrator
+from numba import cuda
 
 yaml_file      = '../gri30.yaml'
 device_torch   = 'cuda'
@@ -96,7 +97,7 @@ integ = CUDABackwardEulerIntegrator(
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-WARP_SIZE         = 32
+WARP_SIZE         = cuda.get_current_device().WARP_SIZE
 THREADS_PER_BLOCK = 64   # doit correspondre à integrator.py
 
 

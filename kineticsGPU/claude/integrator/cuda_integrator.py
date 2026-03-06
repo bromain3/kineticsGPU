@@ -1,42 +1,34 @@
 """
-CUDABackwardEulerIntegrator — v4 (LU + GMRES + timing)
+CUDABackwardEulerIntegrator — v5 (LU + GMRES + timing)
 
-New vs v3
-─────────
-• BUG FIX: GMRES dummy buffers are now shape (B, 1) — Numba requires every
-  2-D slice buf[b] to return a 1-D array regardless of whether GMRES is used.
-  The old (1,) dummies caused a TypingError when the LU path was compiled
-  because Numba inferred a scalar type.
+Perf fixes vs v4
+────────────────
+• Point 2 — élimination des copies CPU→GPU dans la boucle chaude :
+    - h_arr  : copié une seule fois dans integrate() si h est constant,
+               et uniquement si h_eff change (dernier pas tronqué).
+    - t_arr  : plus jamais copié — le kernel n'en a pas besoin pour le calcul
+               (t ne sert pas dans la physique, seulement pour du logging).
+               Le buffer _d_t_arr est supprimé.
+    - conv   : zeroed sur device via un petit kernel dédié (_zero_int_kernel)
+               au lieu d'allouer np.zeros + copy_to_device à chaque pas.
+    - Les buffers h_host et conv_zeros sont pré-alloués une fois dans __init__.
 
-• Timing system:
-    - Pass  do_timing=True  to step() or integrate() to enable.
-    - Cycle counts are accumulated in buf_timers (B, 7) int64 on device.
-    - print_timers() reports mean/max/std over reactors, converted to µs
-      using the SM clock frequency queried at construction time.
-    - reset_timers() zeroes the buffer.
-
-Timer phases
-────────────
-  0  PREDICTOR    initial RHS evaluation + explicit Euler step
-  1  RHS          _eval_rhs_and_context  inside Newton loop  (per Newton iter)
-  2  RESIDUAL     residual norm          inside Newton loop
-  3  JAC_ASSEM    Jacobian assembly      (once per solve when reuse_jacobian)
-  4  LU_FACTOR    LU factorisation       (LU path only, once per Jacobian)
-  5  LINEAR_SOLVE back-substitution (LU) or full GMRES call (per Newton iter)
-  6  UPDATE       xk += dx + physical constraints
-
-Usage
-─────
-    integ = CUDABackwardEulerIntegrator(mech, 1000)
-    TC_hist, t_hist, conv = integ.integrate(TC0, 0, 3e-4, 1e-7, do_timing=True)
-    integ.print_timers()          # pretty summary
-    raw = integ.get_timers()      # numpy array (B, 7)
+• Point 3 — copies device→host limitées :
+    - Les snapshots demandés par save_every sont accumulés dans un buffer
+      device pré-alloué  _d_TC_hist  (n_saves, B, N_state)  et
+      _d_conv_hist  (n_saves, B).
+    - Un kernel _store_snapshot_kernel copie TC_a et conv dans ce buffer.
+    - Une seule paire copy_to_host() à la fin de integrate() transfère
+      tout l'historique en un seul appel.
+    - t_hist reste une simple liste Python (pas de transfer GPU).
 """
 
 import math
 import numpy as np
 import numba.cuda as cuda
 from numba.cuda import get_current_device
+from numba import cuda as nb_cuda, int32, float64
+import time
 
 from ..mechanism.mechanism_data import MechanismData
 from ..kernels.integrator_kernel import (
@@ -59,6 +51,46 @@ _PHASE_NAMES = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper kernels  (device-side utilities, launched once per step or snapshot)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@nb_cuda.jit
+def _zero_int_kernel(arr):
+    """Zero a 1-D int32 array in-place on device — avoids CPU allocation."""
+    i = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
+    if i < arr.shape[0]:
+        arr[i] = int32(0)
+
+
+@nb_cuda.jit
+def _fill_float_kernel(arr, val):
+    """Fill a 1-D float array with val on device — used to broadcast h_eff."""
+    i = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
+    if i < arr.shape[0]:
+        arr[i] = val
+
+
+@nb_cuda.jit
+def _store_snapshot_kernel(TC_src, conv_src, TC_hist, conv_hist, snap_idx):
+    """
+    Copy one row of TC_src (B, N_state) and conv_src (B,) into the
+    pre-allocated history buffers at position snap_idx.
+    One thread per reactor.
+    """
+    b = nb_cuda.blockIdx.x * nb_cuda.blockDim.x + nb_cuda.threadIdx.x
+    if b >= TC_src.shape[0]:
+        return
+    n_state = TC_src.shape[1]
+    for i in range(n_state):
+        TC_hist[snap_idx, b, i] = TC_src[b, i]
+    conv_hist[snap_idx, b] = conv_src[b]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main integrator class
+# ─────────────────────────────────────────────────────────────────────────────
+
 class CUDABackwardEulerIntegrator:
     """
     Per-thread backward Euler integrator for batched chemical reactors.
@@ -74,11 +106,8 @@ class CUDABackwardEulerIntegrator:
         'lu'    — dense LU (exact, O(N³) factor cost)
         'gmres' — restarted GMRES with Givens rotations
     gmres_restart : int
-        Krylov subspace size per restart cycle.
     gmres_tol : float
-        GMRES inner tolerance (can be set looser than newton_tol).
     gmres_maxiter : int
-        Maximum GMRES restart cycles per Newton step.
     dtype : np.dtype
     """
 
@@ -115,11 +144,15 @@ class CUDABackwardEulerIntegrator:
         self.gmres_maxiter   = int(gmres_maxiter)
         self.dtype           = dtype
 
-        # SM clock frequency in kHz → convert cycles to µs: cycles / (kHz * 1e3)
-        self._clock_khz = get_current_device().CLOCK_RATE   # int, kHz
+        self._clock_khz = get_current_device().CLOCK_RATE
         self._d_mech = mechanism.to_cuda_arrays()
         self._alloc_buffers()
         self._mech_args = self._pack_mech_args()
+
+        # ── Pré-allocation des buffers hôte réutilisés dans la boucle ────
+        # Évite numpy allocations répétées dans step()
+        self._h_host    = np.empty(n_reactors, dtype=dtype)   # pour h_arr
+        self._h_current = None   # dernière valeur broadcastée dans _d_h_arr
 
     # ─────────────────────────────────────────────────────────────────────
     #  Buffer allocation
@@ -149,15 +182,18 @@ class CUDABackwardEulerIntegrator:
 
         def buf(shape):  return cuda.device_array(shape, dtype=dt)
         def ibuf(shape): return cuda.device_array(shape, dtype=np.int32)
-        # Dummy 2-D buffer: shape (B, 1) so that buf[b] is always a typed
-        # 1-D array of length 1 — Numba infers the correct array type.
         def dummy2d():   return cuda.device_array((B, 1), dtype=dt)
 
-        # ── Ping-pong state + scalars ─────────────────────────────────────
+        # ── Ping-pong state ───────────────────────────────────────────────
         self._d_TC_a  = buf((B, Nst))
         self._d_TC_b  = buf((B, Nst))
+
+        # ── h_arr : alloué une fois, mis à jour seulement si h change ────
+        # t_arr : SUPPRIMÉ — le kernel n'utilise pas t pour la physique.
         self._d_h_arr = buf((B,))
-        self._d_t_arr = buf((B,))
+
+        # ── conv : buffer device permanent, zeroé via kernel ─────────────
+        self._d_conv  = ibuf((B,))
 
         # ── Newton / LU ───────────────────────────────────────────────────
         self._d_J     = buf((B, Nst * Nst))
@@ -167,42 +203,36 @@ class CUDABackwardEulerIntegrator:
         self._d_dx    = buf((B, Nst))
         self._d_xk    = buf((B, Nst))
         self._d_omega = buf((B, Ns))
-        self._d_conv  = ibuf((B,))
 
         # ── GMRES ─────────────────────────────────────────────────────────
-        # Full allocation when linear_solver='gmres'; 2-D dummies (B,1)
-        # otherwise so that buf_gmres_X[b] is always a typed 1-D array.
         if self.linear_solver == 1:
-            self._d_gmres_V  = buf((B, (R + 1) * Nst))
-            self._d_gmres_H  = buf((B, (R + 1) * R))
-            self._d_gmres_cs = buf((B, R))
-            self._d_gmres_sn = buf((B, R))
-            self._d_gmres_g  = buf((B, R + 1))
-            self._d_gmres_w  = buf((B, Nst))
-            self._d_gmres_y  = buf((B, R))
-            self._d_gmres_vC  = buf((B, Nst))   # ← NEW: v_C scratch
-            self._d_gmres_Jvo = buf((B, Nst))   # ← NEW: Jv_omega scratch
+            self._d_gmres_V   = buf((B, (R + 1) * Nst))
+            self._d_gmres_H   = buf((B, (R + 1) * R))
+            self._d_gmres_cs  = buf((B, R))
+            self._d_gmres_sn  = buf((B, R))
+            self._d_gmres_g   = buf((B, R + 1))
+            self._d_gmres_w   = buf((B, Nst))
+            self._d_gmres_y   = buf((B, R))
+            self._d_gmres_vC  = buf((B, Nst))
+            self._d_gmres_Jvo = buf((B, Nst))
         else:
-            self._d_gmres_V  = dummy2d()
-            self._d_gmres_H  = dummy2d()
-            self._d_gmres_cs = dummy2d()
-            self._d_gmres_sn = dummy2d()
-            self._d_gmres_g  = dummy2d()
-            self._d_gmres_w  = dummy2d()
-            self._d_gmres_y  = dummy2d()
-            self._d_gmres_vC  = dummy2d()        # ← NEW dummy
-            self._d_gmres_Jvo = dummy2d()        # ← NEW dummy
+            self._d_gmres_V   = dummy2d()
+            self._d_gmres_H   = dummy2d()
+            self._d_gmres_cs  = dummy2d()
+            self._d_gmres_sn  = dummy2d()
+            self._d_gmres_g   = dummy2d()
+            self._d_gmres_w   = dummy2d()
+            self._d_gmres_y   = dummy2d()
+            self._d_gmres_vC  = dummy2d()
+            self._d_gmres_Jvo = dummy2d()
 
-        # ── Timing buffer — always allocated, zeros until do_timing=True ──
+        # ── Timing / counting ─────────────────────────────────────────────
         self._d_timers = cuda.device_array((B, N_TIMER_PHASES), dtype=np.int64)
         self._d_timers.copy_to_device(
             np.zeros((B, N_TIMER_PHASES), dtype=np.int64)
         )
-
         self._d_iters = cuda.device_array((B, 2), dtype=np.int64)
-        self._d_iters.copy_to_device(
-            np.zeros((B, 2), dtype=np.int64)
-        )
+        self._d_iters.copy_to_device(np.zeros((B, 2), dtype=np.int64))
 
         # ── Chemistry context ─────────────────────────────────────────────
         self._d_ctx_kf_e    = buf((B, n_e))     if n_e     else dummy2d()
@@ -247,24 +277,54 @@ class CUDABackwardEulerIntegrator:
         self._d_ctx_sp_fall   = buf((B, n_tp_fall)) if n_tp_fall else dummy2d()
 
     # ─────────────────────────────────────────────────────────────────────
+    #  Helpers pour lancer les kernels utilitaires
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _blocks_for(self, n):
+        return math.ceil(n / THREADS_PER_BLOCK)
+
+    def _zero_conv(self):
+        """Zéroer _d_conv entièrement sur device, sans aucune copie CPU."""
+        _zero_int_kernel[self._blocks_for(self.B), THREADS_PER_BLOCK](
+            self._d_conv
+        )
+
+    def _set_h(self, h_eff: float):
+        """
+        Broadcaster h_eff dans _d_h_arr uniquement si la valeur a changé.
+        Évite un copy_to_device + np.full à chaque pas quand h est constant.
+        """
+        if h_eff != self._h_current:
+            _fill_float_kernel[self._blocks_for(self.B), THREADS_PER_BLOCK](
+                self._d_h_arr, self.dtype(h_eff)
+            )
+            self._h_current = h_eff
+
+    # ─────────────────────────────────────────────────────────────────────
     #  step()
     # ─────────────────────────────────────────────────────────────────────
 
-    def step(self, t: float, h: float, do_timing: bool = False, do_count: bool = False):
-        B = self.B
-        self._d_h_arr.copy_to_device(np.full(B, h, dtype=self.dtype))
-        self._d_t_arr.copy_to_device(np.full(B, t, dtype=self.dtype))
-        self._d_conv.copy_to_device(np.zeros(B, dtype=np.int32))
+    def step(self, h_eff: float, do_timing: bool = False, do_count: bool = False):
+        """
+        Effectue un pas de backward Euler.
 
-        blocks = math.ceil(B / THREADS_PER_BLOCK)
+        Paramètre t supprimé : le kernel n'utilise pas t pour la physique.
+        h_eff est broadcasté sur device uniquement s'il a changé depuis le
+        dernier appel (cas du dernier pas tronqué).
+        conv est zéroé via un kernel device (pas de copie CPU).
+        """
+        self._set_h(h_eff)
+        self._zero_conv()
+
+        blocks = self._blocks_for(self.B)
 
         backward_euler_per_thread_kernel[blocks, THREADS_PER_BLOCK](
             self._d_TC_a, self._d_TC_b,
-            self._d_h_arr, self._d_t_arr,
+            self._d_h_arr,
             # Newton / LU
             self._d_J, self._d_LU, self._d_piv,
             self._d_F, self._d_dx, self._d_xk, self._d_omega,
-            # GMRES (dummies when linear_solver='lu', all shape (B, stride))
+            # GMRES
             self._d_gmres_V,
             self._d_gmres_H,
             self._d_gmres_cs,
@@ -272,8 +332,8 @@ class CUDABackwardEulerIntegrator:
             self._d_gmres_g,
             self._d_gmres_w,
             self._d_gmres_y,
-            self._d_gmres_vC,  # ← NEW
-            self._d_gmres_Jvo,  # ← NEW
+            self._d_gmres_vC,
+            self._d_gmres_Jvo,
             # Context – elementary
             self._d_ctx_kf_e,   self._d_ctx_Kc_e,
             self._d_ctx_cr_e,   self._d_ctx_cp_e,  self._d_ctx_RR_e,
@@ -293,7 +353,6 @@ class CUDABackwardEulerIntegrator:
             self._d_ctx_f1_fall,  self._d_ctx_exp_fall,
             self._d_ctx_dG0_fall, self._d_ctx_sr_fall,  self._d_ctx_sp_fall,
             self._d_conv,
-            # Solver parameters
             self.newton_tol,
             self.newton_maxiter,
             self.reuse_jac,
@@ -301,16 +360,13 @@ class CUDABackwardEulerIntegrator:
             np.int32(self.gmres_restart),
             self.gmres_tol,
             np.int32(self.gmres_maxiter),
-            # Timing
             self._d_timers,
             np.int32(1 if do_timing else 0),
-            # Counting
             self._d_iters,
             np.int32(1 if do_count else 0),
-            # Mechanism
             *self._mech_args,
         )
-        print(t)
+
         self._d_TC_a, self._d_TC_b = self._d_TC_b, self._d_TC_a
 
     # ─────────────────────────────────────────────────────────────────────
@@ -328,7 +384,13 @@ class CUDABackwardEulerIntegrator:
         do_count: bool = False,
     ):
         """
-        Integrate from t0 to t_end with fixed step h.
+        Intègre de t0 à t_end avec pas fixe h.
+
+        Optimisations vs v4 :
+        - h_arr et conv ne sont plus copiés via CPU dans la boucle.
+        - Les snapshots sont écrits dans un buffer device pré-alloué
+          (_d_TC_hist, _d_conv_hist) via un kernel léger.
+        - Une seule paire copy_to_host() est effectuée à la fin.
 
         Returns
         -------
@@ -342,64 +404,74 @@ class CUDABackwardEulerIntegrator:
 
         t       = t0
         n_steps = int(math.ceil((t_end - t0) / h))
+        n_saves = math.ceil(n_steps / save_every)
 
-        TC_hist   = []
-        t_hist    = []
-        conv_hist = []
+        # ── Allouer les buffers d'historique sur device ───────────────────
+        d_TC_hist   = cuda.device_array(
+            (n_saves, self.B, self.N_state), dtype=self.dtype
+        )
+        d_conv_hist = cuda.device_array(
+            (n_saves, self.B), dtype=np.int32
+        )
+        t_hist_list = []   # liste Python légère, pas de GPU pour les scalaires
+
+        snap_idx   = 0
+        blocks_b   = self._blocks_for(self.B)
+
+        wall_timer = 0.0
 
         for step_i in range(n_steps):
             h_eff = min(h, t_end - t)
             if h_eff <= 0.0:
                 break
 
-            self.step(t, h_eff, do_timing=do_timing, do_count=do_count)
+            wall_timer -= time.perf_counter()
+            self.step(h_eff, do_timing=do_timing, do_count=do_count)
+            wall_timer += time.perf_counter()
+
             t += h_eff
 
-            if step_i % save_every == 0:
-                TC_hist.append(self._d_TC_a.copy_to_host())
-                t_hist.append(t)
-                conv_hist.append(self._d_conv.copy_to_host())
+            if step_i % save_every == 0 and snap_idx < n_saves:
+                # Copie device→device via kernel : pas de synchronisation forcée
+                _store_snapshot_kernel[blocks_b, THREADS_PER_BLOCK](
+                    self._d_TC_a,
+                    self._d_conv,
+                    d_TC_hist,
+                    d_conv_hist,
+                    np.int32(snap_idx),
+                )
+                t_hist_list.append(t)
+                snap_idx += 1
 
+        # ── Synchronisation unique + copie hôte en bloc ───────────────────
         cuda.synchronize()
 
-        return (
-            np.stack(TC_hist,   axis=0),
-            np.array(t_hist),
-            np.stack(conv_hist, axis=0),
-        )
+        TC_hist   = d_TC_hist.copy_to_host()[:snap_idx]     # (n_saved, B, N_state)
+        conv_hist = d_conv_hist.copy_to_host()[:snap_idx]   # (n_saved, B)
+        t_hist    = np.array(t_hist_list)
+
+        print(f'simulation ended in {wall_timer:.4f}s (wall, kernel launches only)')
+
+        return TC_hist, t_hist, conv_hist
 
     # ─────────────────────────────────────────────────────────────────────
     #  Timing helpers
     # ─────────────────────────────────────────────────────────────────────
 
     def reset_timers(self):
-        """Zero all accumulated cycle counts on device."""
         self._d_timers.copy_to_device(
             np.zeros((self.B, N_TIMER_PHASES), dtype=np.int64)
         )
 
     def get_timers(self) -> np.ndarray:
-        """Return raw timer array (B, 7) of accumulated SM cycle counts."""
         return self._d_timers.copy_to_host()
 
     def get_timers_us(self) -> np.ndarray:
-        """Return timer array (B, 7) converted to microseconds."""
         raw = self.get_timers().astype(np.float64)
         return raw / (self._clock_khz * 1e3)
 
     def print_timers(self, n_steps: int = 1):
-        """
-        Print a summary table of per-phase timings.
-
-        Parameters
-        ----------
-        n_steps : int
-            Number of integration steps over which timers were accumulated.
-            Used to compute per-step averages.
-        """
-        us = self.get_timers_us()  # (B, 7)
-
-        # Mean across reactors, then divide by number of steps
+        us = self.get_timers_us()
         mean_us  = us.mean(axis=0)
         max_us   = us.max(axis=0)
         std_us   = us.std(axis=0)
@@ -420,7 +492,6 @@ class CUDABackwardEulerIntegrator:
         print(f"  {'TOTAL':<14}  {total_us:>10.2f}")
         print(f"{'─'*62}\n")
 
-        # Per-step breakdown
         if n_steps > 1:
             print(f"  Per-step averages (÷{n_steps}):")
             for ph in range(N_TIMER_PHASES):
@@ -428,7 +499,7 @@ class CUDABackwardEulerIntegrator:
             print()
 
     # ─────────────────────────────────────────────────────────────────────
-    #  _pack_mech_args  (unchanged)
+    #  _pack_mech_args  (inchangé)
     # ─────────────────────────────────────────────────────────────────────
 
     def _pack_mech_args(self):
