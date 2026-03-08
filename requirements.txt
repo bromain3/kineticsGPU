@@ -1,2 +1,3 @@
 cantera
 torch
+numba

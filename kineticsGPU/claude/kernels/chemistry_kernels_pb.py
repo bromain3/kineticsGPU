@@ -647,11 +647,6 @@ def _adiabatic_jvp_pb(
 
 # =============================================================================
 #  Restarted GMRES (matrix-free, JVP-based) — per-block version
-#
-#  Shared memory inputs (already allocated in main kernel):
-#    sh_rhs, sh_dx, sh_w, sh_g, sh_y, sh_cs, sh_sn, sh_H, sh_scratch
-#  Global memory input:
-#    gm_V  — Krylov basis, shape ((R+1)*n_state,) for this block
 # =============================================================================
 
 @cuda.jit(device=True)
@@ -659,13 +654,13 @@ def _gmres_pb(
     tid, n_threads,
     T, C, h, omega,
     sh_rhs, sh_dx,
-    sh_w,                       # length n_state — also used as tmp Jv_TC
-    sh_g, sh_y, sh_cs, sh_sn,  # GMRES scalars in shared
-    sh_H,                       # (R+1)*R in shared
-    sh_scratch,                 # reduction scratch, length >= n_threads
-    sh_Jvo,                     # shared scratch for Jv_om (length n_sp)
-    sh_vC,                      # shared scratch for vC   (length n_sp)
-    gm_V,                       # global Krylov basis, length (R+1)*n_state
+    sh_w,
+    sh_g, sh_y, sh_cs, sh_sn,
+    sh_H,
+    sh_scratch,
+    sh_Jvo,
+    sh_vC,
+    gm_V,
     n_state, R, tol, maxiter,
     kf_e, Kc_e, cr_e, cp_e, dG0_e, sR_re, sR_pe,
     kf_tb, Kc_tb, cr_tb, cp_tb, dG0_tb, sR_rtb, sR_ptb, bRR_tb, M_tb,
@@ -690,7 +685,7 @@ def _gmres_pb(
     _block_norm2(sh_rhs, sh_scratch, tid, n_state, n_threads)
     cuda.syncthreads()
     if tid == 0:
-        sh_g[0] = math.sqrt(sh_scratch[0])   # reuse g[0] as beta temporarily
+        sh_g[0] = math.sqrt(sh_scratch[0])
     cuda.syncthreads()
     beta = sh_g[0]
     if beta < tol:
@@ -714,15 +709,13 @@ def _gmres_pb(
         cuda.syncthreads()
 
         if outer == 0:
-            # V[:,0] = rhs / beta
             inv = float64(1.0) / beta
             i = tid
             while i < n_state:
-                gm_V[i] = sh_rhs[i] * inv   # column 0 of V
+                gm_V[i] = sh_rhs[i] * inv
                 i += n_threads
             cuda.syncthreads()
         else:
-            # Compute true residual: r = rhs - (dx - h * J*dx)
             vT_ = sh_dx[0]
             i = tid
             while i < n_sp:
@@ -743,13 +736,11 @@ def _gmres_pb(
                 n_f, fA0, fb0, fE0, fAi, fbi, fEi,
                 fOW, fDn, fTA, fT1, fT2, fT3, fIT, fRI, fRS, fRO, fPI, fPS, fPO, fEff,
             )
-            # sh_w = adiabatic JVP output  (Jv_TC)
             _adiabatic_jvp_pb(
                 tid, n_threads,
                 T, C, vT_, sh_vC, omega, sh_Jvo, n_sp, thL, thH, thM,
                 sh_w, sh_scratch,
             )
-            # residual r = rhs - (dx - h*w);  store in w, compute norm
             _block_norm2_inplace_sub(
                 sh_rhs, sh_dx, sh_w, h, sh_scratch, sh_w,
                 tid, n_state, n_threads,
@@ -775,15 +766,13 @@ def _gmres_pb(
         for j in range(R):
             vj_off = j * n_state
 
-            # Extract V[:,j] → vT_, vC
-            vT_ = gm_V[vj_off]     # scalar, broadcast via register
+            vT_ = gm_V[vj_off]
             i = tid
             while i < n_sp:
                 sh_vC[i] = gm_V[vj_off + i + 1]
                 i += n_threads
             cuda.syncthreads()
 
-            # w = V[:,j] - h * J*V[:,j]  (overwrite sh_w)
             _eval_jvp_pb(
                 tid, n_threads,
                 T, C, vT_, sh_vC, sh_Jvo,
@@ -803,17 +792,15 @@ def _gmres_pb(
                 T, C, vT_, sh_vC, omega, sh_Jvo, n_sp, thL, thH, thM,
                 sh_w, sh_scratch,
             )
-            # w = V[:,j] - h*w  (i.e. (I - h*J)*V[:,j])
             i = tid
             while i < n_state:
                 sh_w[i] = gm_V[vj_off + i] - h * sh_w[i]
                 i += n_threads
             cuda.syncthreads()
 
-            # Modified Gram–Schmidt orthogonalisation
+            # Modified Gram–Schmidt
             for ii in range(j+1):
                 vi_off = ii * n_state
-                # hij = dot(w, V[:,ii])
                 _block_dot(sh_w, gm_V[vi_off:vi_off+n_state],
                            sh_scratch, tid, n_state, n_threads)
                 cuda.syncthreads()
@@ -821,14 +808,12 @@ def _gmres_pb(
                 if tid == 0:
                     sh_H[ii*R + j] = hij
                 cuda.syncthreads()
-                # w -= hij * V[:,ii]
                 i = tid
                 while i < n_state:
                     sh_w[i] -= hij * gm_V[vi_off + i]
                     i += n_threads
                 cuda.syncthreads()
 
-            # h_{j+1,j} = ||w||
             _block_norm2(sh_w, sh_scratch, tid, n_state, n_threads)
             cuda.syncthreads()
             h_j1j = math.sqrt(sh_scratch[0])
@@ -836,7 +821,6 @@ def _gmres_pb(
                 sh_H[(j+1)*R + j] = h_j1j
             cuda.syncthreads()
 
-            # V[:,j+1] = w / h_{j+1,j}
             vj1_off = (j+1) * n_state
             if h_j1j > 1e-300:
                 inv2 = float64(1.0) / h_j1j
@@ -851,7 +835,6 @@ def _gmres_pb(
                     i += n_threads
             cuda.syncthreads()
 
-            # Apply previous Givens rotations + new one — thread 0 only
             if tid == 0:
                 for ii in range(j):
                     hi  = sh_H[ii*R+j]; hi1 = sh_H[(ii+1)*R+j]
@@ -876,7 +859,7 @@ def _gmres_pb(
                 j_conv = j+1
                 break
 
-        # ── Back-substitution — thread 0 only ────────────────────────
+        # ── Back-substitution ─────────────────────────────────────────
         m = j_conv
         if tid == 0:
             for k in range(m-1, -1, -1):
@@ -887,7 +870,6 @@ def _gmres_pb(
                 sh_y[k] = s_/d if abs(d) > 1e-300 else float64(0.0)
         cuda.syncthreads()
 
-        # dx += V[:,:m] @ y[:m]  — parallel over rows of V
         i = tid
         while i < n_state:
             acc = float64(0.0)
@@ -923,7 +905,6 @@ def _gmres_pb(
             T, C, vT_, sh_vC, omega, sh_Jvo, n_sp, thL, thH, thM,
             sh_w, sh_scratch,
         )
-        # res_true = ||rhs - (dx - h*w)||
         _block_norm2_inplace_sub(
             sh_rhs, sh_dx, sh_w, h, sh_scratch, sh_w,
             tid, n_state, n_threads,
@@ -939,16 +920,11 @@ def _gmres_pb(
 
 
 # =============================================================================
-#  Helper: compute r = rhs - (dx - h*Jv), write into out, return ||r||^2
-#  in scratch[0].  Uses sh_w as the Jv_TC input (already computed).
+#  Helper: r = rhs - (dx - h*Jv), return ||r||^2 in scratch[0]
 # =============================================================================
 
 @cuda.jit(device=True, inline=True)
 def _block_norm2_inplace_sub(rhs, dx, Jv_TC, h, scratch, out, tid, n, n_threads):
-    """
-    out[i] = rhs[i] - (dx[i] - h * Jv_TC[i])
-    scratch[0] = ||out||^2
-    """
     acc = float64(0.0)
     i = tid
     while i < n:
@@ -963,16 +939,14 @@ def _block_norm2_inplace_sub(rhs, dx, Jv_TC, h, scratch, out, tid, n, n_threads)
 #  Main kernel — one BLOCK per reactor
 # =============================================================================
 
-@cuda.jit
+@cuda.jit(cache=True)
 def backward_euler_kernel_pb(
     TC_in, TC_out,
     h_scalar,
     newton_tol, newton_maxiter,
     gmres_restart, gmres_tol, gmres_maxiter,
     converged,
-    # GMRES Krylov basis — global, (B, (R+1)*n_state)
     gm_V,
-    # Chemistry context — global, (B, n_reactions) or (B, n_flat)
     ctx_kf_e,   ctx_Kc_e,  ctx_cr_e,  ctx_cp_e,  ctx_dG0_e,
     ctx_sRre,   ctx_sRpe,
     ctx_kf_tb,  ctx_Kc_tb, ctx_cr_tb, ctx_cp_tb, ctx_dG0_tb,
@@ -981,7 +955,6 @@ def backward_euler_kernel_pb(
     ctx_sRrf,   ctx_sRpf,
     ctx_k0_f,   ctx_kinf_f, ctx_M_f,  ctx_Pr_f,  ctx_F_f,   ctx_kb_f,
     ctx_Fc_f,   ctx_lFc_f, ctx_Cp_f,  ctx_Np_f,  ctx_f1_f,  ctx_exp_f,
-    # mechanism (read-only, shared across all blocks)
     n_sp,
     thL, thH, thM,
     n_e, eA, en, eEa, eOW, eDn, eRI, eRS, eRO, ePI, ePS, ePO,
@@ -1006,24 +979,20 @@ def backward_euler_kernel_pb(
     h = h_scalar
 
     # ── Shared memory allocation ──────────────────────────────────────
-    # Per-reactor state vectors (hot path)
-    sh_xk  = cuda.shared.array(MAX_N_STATE, float64)  # current iterate
-    sh_C   = cuda.shared.array(MAX_N_STATE, float64)  # species conc slice
-    sh_om  = cuda.shared.array(MAX_N_STATE, float64)  # omega (RHS species)
-    sh_dTC = cuda.shared.array(MAX_N_STATE, float64)  # adiabatic RHS
-    sh_rhs = cuda.shared.array(MAX_N_STATE, float64)  # GMRES RHS = -F(xk)
-    sh_dx  = cuda.shared.array(MAX_N_STATE, float64)  # GMRES solution dx
-    sh_w   = cuda.shared.array(MAX_N_STATE, float64)  # GMRES work vector
-    sh_Jvo = cuda.shared.array(MAX_N_STATE, float64)  # Jv_om scratch
-    sh_vC  = cuda.shared.array(MAX_N_STATE, float64)  # vC scratch for JVP
-    # GMRES scalars / small arrays
+    sh_xk  = cuda.shared.array(MAX_N_STATE, float64)
+    sh_C   = cuda.shared.array(MAX_N_STATE, float64)
+    sh_om  = cuda.shared.array(MAX_N_STATE, float64)
+    sh_dTC = cuda.shared.array(MAX_N_STATE, float64)
+    sh_rhs = cuda.shared.array(MAX_N_STATE, float64)
+    sh_dx  = cuda.shared.array(MAX_N_STATE, float64)
+    sh_w   = cuda.shared.array(MAX_N_STATE, float64)
+    sh_Jvo = cuda.shared.array(MAX_N_STATE, float64)
+    sh_vC  = cuda.shared.array(MAX_N_STATE, float64)
     sh_g   = cuda.shared.array(MAX_R_p_1, float64)
     sh_y   = cuda.shared.array(MAX_R,     float64)
     sh_cs  = cuda.shared.array(MAX_R,     float64)
     sh_sn  = cuda.shared.array(MAX_R,     float64)
-    # Hessenberg matrix — (R+1) x R
-    sh_H   = cuda.shared.array(MAX_R_H, float64)
-    # Reduction scratch
+    sh_H   = cuda.shared.array(MAX_R_H,   float64)
     sh_scratch = cuda.shared.array(THREADS_PER_BLOCK, float64)
 
     # ── Load initial state into shared ───────────────────────────────
@@ -1033,8 +1002,7 @@ def backward_euler_kernel_pb(
         i += n_threads
     cuda.syncthreads()
 
-    # ── Convenience aliases for context row-slices (this reactor) ────
-    # These are global-memory views; indexed without 'b' inside device fns.
+    # ── Context row-slices for this reactor ──────────────────────────
     e_kf   = ctx_kf_e[b];   e_Kc  = ctx_Kc_e[b]
     e_cr   = ctx_cr_e[b];   e_cp  = ctx_cp_e[b];  e_dG = ctx_dG0_e[b]
     e_sRr  = ctx_sRre[b];   e_sRp = ctx_sRpe[b]
@@ -1082,7 +1050,6 @@ def backward_euler_kernel_pb(
         sh_dTC, sh_scratch,
     )
 
-    # xk = x0 + h * dTC  (explicit Euler predictor)
     i = tid
     while i < n_state:
         sh_xk[i] = TC_in[b, i] + h * sh_dTC[i]
@@ -1091,7 +1058,7 @@ def backward_euler_kernel_pb(
     if tid == 0:
         if sh_xk[0] < 1.0:
             sh_xk[0] = 1.0
-    i = tid + 1   # skip T
+    i = tid + 1
     while i < n_state:
         if sh_xk[i] < 0.0:
             sh_xk[i] = float64(0.0)
@@ -1127,12 +1094,10 @@ def backward_euler_kernel_pb(
             sh_dTC, sh_scratch,
         )
 
-        # rhs = -F(xk) = -(xk - x0 - h*dTC)
-        # res2 in parallel
         acc = float64(0.0)
         i = tid
         while i < n_state:
-            fi       = sh_xk[i] - TC_in[b, i] - h * sh_dTC[i]
+            fi        = sh_xk[i] - TC_in[b, i] - h * sh_dTC[i]
             sh_rhs[i] = -fi
             acc      += fi * fi
             i += n_threads
@@ -1146,7 +1111,6 @@ def backward_euler_kernel_pb(
             cuda.syncthreads()
             break
 
-        # GMRES solve
         _gmres_pb(
             tid, n_threads,
             T_loc, sh_C, h, sh_om,
@@ -1167,7 +1131,6 @@ def backward_euler_kernel_pb(
             fOW, fDn, fTA, fT1, fT2, fT3, fIT, fRI, fRS, fRO, fPI, fPS, fPO, fEff,
         )
 
-        # xk += dx
         i = tid
         while i < n_state:
             sh_xk[i] += sh_dx[i]
@@ -1183,30 +1146,9 @@ def backward_euler_kernel_pb(
             i += n_threads
         cuda.syncthreads()
 
-    # ── Write result to global memory ─────────────────────────────────
+    # ── Écriture du résultat en mémoire globale ───────────────────────
     i = tid
     while i < n_state:
         TC_out[b, i] = sh_xk[i]
         i += n_threads
     cuda.syncthreads()
-
-
-# =============================================================================
-#  Utility kernels  (unchanged)
-# =============================================================================
-
-@cuda.jit
-def _fill_int_zero(arr):
-    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-    if i < arr.shape[0]:
-        arr[i] = int32(0)
-
-
-@cuda.jit
-def _store_snapshot(TC_src, conv_src, TC_hist, conv_hist, snap_idx):
-    b = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-    if b >= TC_src.shape[0]:
-        return
-    for i in range(TC_src.shape[1]):
-        TC_hist[snap_idx, b, i] = TC_src[b, i]
-    conv_hist[snap_idx, b] = conv_src[b]

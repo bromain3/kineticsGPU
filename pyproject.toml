@@ -16,6 +16,7 @@ dependencies = [
     #"matplotlib",
     "cantera",
     "torch",
+    "numba",
     #"pyyaml",
     #"polene",
     #"scipy"

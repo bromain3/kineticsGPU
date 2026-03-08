@@ -660,7 +660,7 @@ def _gmres(
 #  Main kernel — one thread per reactor
 # =============================================================================
 
-@cuda.jit
+@cuda.jit(cache=True)
 def backward_euler_kernel(
     TC_in, TC_out,
     h_scalar,

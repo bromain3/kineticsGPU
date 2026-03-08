@@ -12,10 +12,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import kineticsGPU.thermo as yaml_thermo
 from kineticsGPU.reactionParser import parseReactions, build_reactions
-# ← point these imports at your new production files
 from kineticsGPU.claude.mechanism.mechanism_data import build_mechanism_data_from_torch
-#from kineticsGPU.claude.integrator.cuda_integrator import CUDABackwardEulerIntegrator
 from kineticsGPU.claude.integrator.cuda_integrator_pb import CUDABackwardEulerIntegratorPB as CUDABackwardEulerIntegrator
+import numba.cuda as cuda
 
 try:
     import cantera as ct
@@ -71,7 +70,7 @@ def main():
     print(f"  n_species={mech.n_species}, n_reactions={mech.n_reactions_total}")
 
     # ── Initial conditions ─────────────────────────────────────────────
-    n_reactors = 1
+    n_reactors = 100
     print(f"\nSetting up {n_reactors} CH4/air reactors ...")
 
     np.random.seed(0)
@@ -104,19 +103,47 @@ def main():
         dtype          = dtype,
     )
 
-    t_end   = 3e-4
-    h       = 1e-7
-    n_steps = int(t_end / h)
+    t_end    = 3e-4
+    h        = 1e-7
+    n_steps  = int(t_end / h)
+    save_every = 10
+
+    # ── Upload initial state to device once ────────────────────────────
+    d_TC = cuda.to_device(np.ascontiguousarray(TC0, dtype=dtype))
 
     print(f"\nIntegrating {n_reactors} reactors, {n_steps} steps (h={h:.1e}s) ...")
-    TC_hist, t_hist, conv_hist = integrator.integrate(
-        TC0, 0.0, t_end, h, save_every=1)
-    print(f"  JIT + first run: {time.perf_counter()-t0_compile:.2f}s total")
 
-    TC_final = TC_hist[-1]
+    TC_snapshots = []
+    t_snapshots  = []
+    t = 0.0
+
+    t_wall = 0.0
+    for step_i in range(n_steps):
+        h_eff = min(h, t_end - t)
+        if h_eff <= 0.0:
+            break
+
+        t_wall -= time.perf_counter()
+        d_TC = integrator.step(d_TC, h_eff)
+        t_wall += time.perf_counter()
+
+        t += h_eff
+
+        if step_i % save_every == 0:
+            TC_snapshots.append(d_TC.copy_to_host())
+            t_snapshots.append(t)
+
+    print(f"  JIT + first run: {time.perf_counter()-t0_compile:.2f}s total")
+    print(f"  Integration wall time: {t_wall:.4f}s "
+          f"({1e6*t_wall/n_steps:.2f} µs/step, {n_reactors} reactors, "
+          f"per-block launch {n_reactors}×64)")
+
+    TC_hist  = np.stack(TC_snapshots, axis=0)   # (n_saves, B, n_state)
+    t_hist   = np.array(t_snapshots)
+    TC_final = d_TC.copy_to_host()
+
     T_final  = TC_final[:, 0]
     print(f"  T final range: [{T_final.min():.1f}, {T_final.max():.1f}] K")
-    print(f"  Converged at last step: {conv_hist[-1].sum()}/{n_reactors}")
 
     # ── Cantera comparison ─────────────────────────────────────────────
     if HAS_CANTERA:
@@ -141,7 +168,7 @@ def main():
         # Trajectory plot
         print("\nPlotting trajectory ...")
         T_ct, C_ct = run_cantera_trajectory(T0s[0], C0s[0], t_end, h*10)
-        t_gpu   = np.array(t_hist)
+        t_gpu   = t_hist
         T_gpu_t = TC_hist[:, 0, 0]
         C_gpu_t = TC_hist[:, 0, 1:]
         top4    = np.argsort(C_ref)[-4:][::-1]
