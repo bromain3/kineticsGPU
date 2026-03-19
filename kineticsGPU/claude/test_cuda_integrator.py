@@ -124,7 +124,7 @@ def main():
             break
 
         t_wall -= time.perf_counter()
-        d_TC = integrator.step(d_TC, h_eff)
+        d_TC, _ = integrator.step(d_TC, h_eff)
         t_wall += time.perf_counter()
 
         t += h_eff

@@ -184,7 +184,7 @@ class CUDABackwardEulerIntegratorPB:
         )
         cuda.synchronize()
         #TODO: return the convergence flag
-        return self._d_TC_out
+        return self._d_TC_out, self._d_conv
 
     # ─────────────────────────────────────────────────────────────────────
 
