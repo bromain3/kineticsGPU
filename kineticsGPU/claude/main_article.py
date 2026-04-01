@@ -14,8 +14,20 @@ import numpy as np
 import math
 import time
 import sys, os
+
+from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
+from kineticsGPU.reactionTypes import (
+    ReactionSystem, ElementaryReactionBatch,
+    ThreeBodyReactionBatch, FalloffReactionBatch,
+)
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
+from kineticsGPU.reactionTypes import (
+    ReactionSystem, ElementaryReactionBatch,
+    ThreeBodyReactionBatch, FalloffReactionBatch,
+)
 import kineticsGPU.thermo as yaml_thermo
 from kineticsGPU.reactionParser import parseReactions, build_reactions
 from kineticsGPU.claude.mechanism.mechanism_data import build_mechanism_data_from_torch
@@ -42,14 +54,19 @@ Integrators          = True
 Architecture_compare = True
 Scalability          = True
 Error_analysis       = True
+JVP_validation       = True
+
 
 N_reactors_list      = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
 N_STEPS_SCALABILITY  = 3000
 
-SIZE        = 1000
+SIZE        = 10
 T_END       = 3e-4
 H_DEFAULT   = 1e-7
 H_LIST      = [5e-6, 2e-6, 1e-6, 5e-7, 2e-7, 1e-7, 5e-8, 2e-8, 1e-8, 5e-9, 2e-9]
+
+device = torch.device('cuda:0')
+cuda.select_device(device.index)
 
 os.makedirs('article_figures', exist_ok=True)
 
@@ -149,7 +166,7 @@ y      = yaml_thermo.yamlParser(yaml_file)
 vec_th = y.populateVectorizedThermoObject(dtype=torch.float64, device='cuda')
 rxns   = parseReactions(yaml_file)
 gas    = ct.Solution(yaml_file)
-r_e, r_tb, r_f, _ = build_reactions(vec_th.species, rxns, vec_th, 'cuda',
+r_e, r_tb, r_f, _ = build_reactions(vec_th.species, rxns, vec_th, device,
                                      torch.float64)
 mech   = build_mechanism_data_from_torch(r_e, r_tb, r_f, vec_th, dtype=dtype_np)
 reactions_index_to_type = [r['type'] for r in rxns]
@@ -244,11 +261,11 @@ if RR_and_source_terms:
 
     plot_box(
         [e_MAE_err, tb_MAE_err, f_MAE_err, om_MAE_err],
-        ['Elem.\nRR', 'TB\nRR', 'Falloff\nRR', r'$\dot\omega$'],
+        ['Elementary\nRR', 'Third body\nRR', 'Falloff\nRR', r'$\dot\omega$'],
         'article_figures/RR_MAE.png', ylabel='MAE (mol m$^{-3}$ s$^{-1}$)')
     plot_box(
         [e_MSE_err, tb_MSE_err, f_MSE_err, om_MSE_err],
-        ['Elem.\nRR', 'TB\nRR', 'Falloff\nRR', r'$\dot\omega$'],
+        ['Elementary\nRR', 'Third body\nRR', 'Falloff\nRR', r'$\dot\omega$'],
         'article_figures/RR_MSE.png', ylabel='MSE (mol$^2$ m$^{-6}$ s$^{-2}$)')
 
     e_rel  = np.abs(RRs_e_can  - RR_e_gpu)  / (np.abs(RRs_e_can)  + 1e-100)
@@ -258,7 +275,7 @@ if RR_and_source_terms:
 
     plot_box(
         [e_rel, tb_rel, f_rel, om_rel],
-        ['Elem.\nRR', 'TB\nRR', 'Falloff\nRR', r'$\dot\omega$'],
+        ['Elementary\nRR', 'Third body\nRR', 'Falloff\nRR', r'$\dot\omega$'],
         'article_figures/RR_relative_error.png',
         ylabel='Relative error (--)')
     print('  Figures: RR_MAE, RR_MSE, RR_relative_error')
@@ -267,7 +284,7 @@ if RR_and_source_terms:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_cantera_CV(T0, C0_mol, t_ref):
+def run_cantera_CV(T0, C0_mol, t_ref, h):
     g = ct.Solution(yaml_file)
     g.TP = float(T0), 101325.0
     g.concentrations = C0_mol * 1e-3
@@ -275,7 +292,7 @@ def run_cantera_CV(T0, C0_mol, t_ref):
     sim = ct.ReactorNet([r])
     ts, Ts, Ps, Xs = [], [], [], []
     while sim.time < t_ref[-1]:
-        sim.step()
+        sim.advance(sim.time + h)
         ts.append(sim.time); Ts.append(r.T)
         Ps.append(r.thermo.P); Xs.append(r.thermo.X.copy())
     return interp_traj(np.array(ts), np.array(Ts),
@@ -327,7 +344,7 @@ if Integrators:
     t0 = time.perf_counter()
     cant_T = []; cant_X = []; cant_P = []
     for i in range(SIZE):
-        T, P, X = run_cantera_CV(T_all[i], C_all[i], t_ref)
+        T, P, X = run_cantera_CV(T_all[i], C_all[i], t_ref, H_DEFAULT)
         cant_T.append(T); cant_P.append(P); cant_X.append(X)
     t_can = time.perf_counter() - t0
     cant_T = np.array(cant_T); cant_P = np.array(cant_P); cant_X = np.array(cant_X)
@@ -346,11 +363,17 @@ if Integrators:
 
     # Figure 1 : trajectoire température réacteur référence
     fig, ax = plt.subplots()
-    ax.plot(t_ref*1e6, cant_T[0], label='Cantera', color=COLORS[0])
-    ax.plot(t_ref*1e6, gpu_T[0],  label='GPU (BE)', color=COLORS[2],
-            linestyle=':', linewidth=0.7)
-    ax.set_xlabel(r'Time ($\mu$s)')
-    ax.set_ylabel('Temperature (K)')
+    #ax.plot(t_ref*1e6, cant_T[0], label='Cantera', color=COLORS[0])
+    #ax.plot(t_ref*1e6, gpu_T[0],  label='GPU (BE)', color=COLORS[2], linestyle=':', linewidth=0.7)
+    #ax.set_xlabel(r'Time ($\mu$s)')
+    #ax.set_ylabel('Temperature (K)')
+    dT_dt_ref = np.diff(cant_T[0], prepend=cant_T[0][0]) / H_DEFAULT
+    sc = ax.scatter(gpu_T[0], cant_T[0], c=np.abs(dT_dt_ref), s=4, marker='o', cmap='viridis', rasterized=True)
+    cb = plt.colorbar(sc, ax=ax)
+    cb.set_label(r'$|dT/dt|$ (K/s)')
+    ax.set_xlabel(r'$T_{\rm GPU}$ (K)')
+    ax.set_ylabel(r'$T_{\rm Cantera}$ (K)')
+    ax.axline((gpu_T[0][0], cant_T[0][0]), slope=1, color='red', linewidth=1, linestyle='--', label='x=y')
     ax.legend()
     plt.tight_layout()
     plt.savefig('article_figures/T_trajectory.png', bbox_inches='tight')
@@ -600,7 +623,7 @@ if Error_analysis and Integrators:
 
     for h_test in H_LIST:
         t_ref_h  = np.arange(h_test, T_END + h_test, h_test)
-        T_can_ref, _, _ = run_cantera_CV(1700.0, C0_ref_single, t_ref_h)
+        T_can_ref, _, _ = run_cantera_CV(1700.0, C0_ref_single, t_ref_h, H_DEFAULT)
 
         intgr_h = CUDABackwardEulerIntegratorPB(mech, 1, dtype=dtype_np)
         TC0_h   = np.concatenate([[1700.0], C0_ref_single])[None, :].astype(dtype_np)
@@ -648,6 +671,206 @@ if Error_analysis and Integrators:
     plt.savefig('article_figures/step_size_sensitivity.png', bbox_inches='tight')
     plt.close()
     print('  Figure: step_size_sensitivity.png')
+
+"""
+PATCH — Section à insérer dans test_cuda_integrator_full.py
+
+1. Dans le bloc d'imports, ajouter :
+   from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
+
+2. Dans le bloc Flags, ajouter :
+   JVP_validation = True
+
+3. Ajouter la section ci-dessous après la section Error_analysis (fin du fichier,
+   avant le print "All sections complete").
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. JVP validation — Cantera exact vs Torch vs CUDA per-block
+#
+# On valide uniquement la JVP de omega = dC/dt (mol/m³/s).
+# C'est ce que calculent _eval_jvp_pb (CUDA) et rxn_sys.jvp (Torch).
+#
+# Référence Cantera (100% analytique, zéro différences finies) :
+#   Jv_om = net_production_rates_ddCi @ vC  +  net_production_rates_ddT * vT
+#
+# Conversions d'unités Cantera → mol :
+#   net_production_rates_ddCi : s⁻¹  (∂(kmol/m³/s)/∂(kmol/m³), les 1e3 se
+#                               compensent quand vC est en mol/m³)
+#   net_production_rates_ddT  : kmol/m³/s/K  →  ×1e3  →  mol/m³/s/K
+# ─────────────────────────────────────────────────────────────────────────────
+if JVP_validation:
+    print('\n' + '='*70)
+    print('Section 6 — JVP validation (Cantera exact / Torch / CUDA per-block)')
+
+    from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
+    from kineticsGPU.reactionTypes import (
+        ReactionSystem, ElementaryReactionBatch,
+        ThreeBodyReactionBatch, FalloffReactionBatch,
+    )
+
+    N_JVP = 200
+
+    np.random.seed(99)
+    T_jvp  = np.random.uniform(800, 4000, N_JVP).astype(dtype_np)
+    C_jvp  = np.abs(np.random.randn(N_JVP, n_sp).astype(dtype_np)) * 5.0
+    vT_raw = np.random.randn(N_JVP).astype(dtype_np)
+    vC_raw = np.random.randn(N_JVP, n_sp).astype(dtype_np)
+    norms  = np.sqrt(vT_raw**2 + (vC_raw**2).sum(axis=1))
+    vT_jvp = vT_raw / norms
+    vC_jvp = vC_raw / norms[:, None]
+
+    # ── 1. Référence Cantera — JVP exacte de omega ────────────────────────────
+    def _cantera_jvp_om(T, C, vT, vC):
+        """
+        Jv_om = (∂ω/∂C) · vC + (∂ω/∂T) · vT   [mol/m³/s]
+        Uniquement des dérivées analytiques fournies par Cantera.
+        """
+        g = ct.Solution(yaml_file)
+        g.TP = float(T), 101325.0
+        g.concentrations = np.maximum(C, 0.0) * 1e-3      # mol/m³ → kmol/m³
+
+        # ddCi en s⁻¹ : ∂(kmol/m³/s)/∂(kmol/m³)
+        # vC en mol/m³, donc ddCi @ vC = [s⁻¹][mol/m³] = mol/m³/s  ✓
+        ddCi = np.array(g.net_production_rates_ddCi)       # (n_sp, n_sp), s⁻¹
+        ddT  = np.array(g.net_production_rates_ddT) * 1e3  # (n_sp,), mol/m³/s/K
+
+        return ddCi @ vC + ddT * vT                        # (n_sp,), mol/m³/s
+
+    print(f'  Computing Cantera exact JVP (N={N_JVP}) ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    ref_jvC = np.zeros((N_JVP, n_sp), dtype=dtype_np)
+    for i in range(N_JVP):
+        ref_jvC[i] = _cantera_jvp_om(T_jvp[i], C_jvp[i], vT_jvp[i], vC_jvp[i])
+    print(f'{time.perf_counter()-t0:.1f}s')
+
+    # ── 2. Torch JVP de omega ─────────────────────────────────────────────────
+    batched_elem = ElementaryReactionBatch(r_e, device=str(device), dtype=torch.float64)
+    batched_tb   = ThreeBodyReactionBatch(r_tb, device=str(device), dtype=torch.float64)
+    batched_f    = FalloffReactionBatch(r_f,   device=str(device), dtype=torch.float64)
+    rxn_sys      = ReactionSystem([batched_elem, batched_tb, batched_f])
+
+    print('  Computing Torch JVP ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    T_t  = torch.tensor(T_jvp,  device=device, dtype=torch.float64)
+    C_t  = torch.tensor(C_jvp,  device=device, dtype=torch.float64)
+    vT_t = torch.tensor(vT_jvp, device=device, dtype=torch.float64)
+    vC_t = torch.tensor(vC_jvp, device=device, dtype=torch.float64)
+    torch_jvC = rxn_sys.jvp(T_t, C_t, vT_t, vC_t).cpu().numpy()  # (N, n_sp)
+    torch.cuda.synchronize()
+    print(f'{time.perf_counter()-t0:.4f}s')
+
+    # ── 3. CUDA per-block JVP de omega ────────────────────────────────────────
+    jvp_ev = CUDAJVPEvaluator(mech, dtype=dtype_np)
+    jvp_ev.evaluate(T_jvp[:1], C_jvp[:1], vT_jvp[:1], vC_jvp[:1])  # warmup JIT
+    print('  CUDA JVP evaluator JIT: done')
+
+    print('  Computing CUDA per-block JVP ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    cuda_Jv_om, _ = jvp_ev.evaluate(T_jvp, C_jvp, vT_jvp, vC_jvp)
+    t_cuda_jvp = time.perf_counter() - t0
+    print(f'{t_cuda_jvp:.4f}s')
+
+    # ── Métriques ─────────────────────────────────────────────────────────────
+    def _stats(label, a, b_ref):
+        diff = np.abs(a - b_ref)
+        rel  = diff / (np.abs(b_ref) + 1e-100)
+        print(f'    {label}')
+        print(f'      MAE  = {diff.mean():.3e}  ± {diff.std():.3e}  max={diff.max():.3e}')
+        print(f'      rMAE = {rel.mean():.3e}  ± {rel.std():.3e}  max={rel.max():.3e}')
+        return diff, rel
+
+    print('\n  ── Jv_om components (N×n_sp flattened) ──')
+    d_torch, r_torch = _stats('Torch vs Cantera exact',
+                               torch_jvC.ravel(), ref_jvC.ravel())
+    d_cuda,  r_cuda  = _stats('CUDA  vs Cantera exact',
+                               cuda_Jv_om.ravel(), ref_jvC.ravel())
+    d_tc,    r_tc    = _stats('CUDA  vs Torch',
+                               cuda_Jv_om.ravel(), torch_jvC.ravel())
+
+    # ── Erreur par espèce ─────────────────────────────────────────────────────
+    sp_mae_torch = np.abs(torch_jvC  - ref_jvC).mean(axis=0)
+    sp_mae_cuda  = np.abs(cuda_Jv_om - ref_jvC).mean(axis=0)
+    sp_names     = gas.species_names
+    worst5_torch = np.argsort(sp_mae_torch)[-5:][::-1]
+    worst5_cuda  = np.argsort(sp_mae_cuda )[-5:][::-1]
+
+    print('\n  Top-5 worst species (Torch vs Cantera exact):')
+    for k in worst5_torch:
+        print(f'    {sp_names[k]:12s}  MAE={sp_mae_torch[k]:.3e}')
+    print('  Top-5 worst species (CUDA vs Cantera exact):')
+    for k in worst5_cuda:
+        print(f'    {sp_names[k]:12s}  MAE={sp_mae_cuda[k]:.3e}')
+
+    # ── Figures ───────────────────────────────────────────────────────────────
+
+    # Fig 1 — Boxplots MAE absolue + relative, 3 comparaisons
+    fig, axes = plt.subplots(2, 3, figsize=(10, 5))
+    pairs = [
+        ('Torch vs\nCantera exact', d_torch, r_torch),
+        ('CUDA vs\nCantera exact',  d_cuda,  r_cuda),
+        ('CUDA vs\nTorch',          d_tc,    r_tc),
+    ]
+    for col, (title, d_abs, d_rel) in enumerate(pairs):
+        for row, (data, ylabel) in enumerate([
+            (d_abs, r'MAE (mol m$^{-3}$ s$^{-1}$)'),
+            (d_rel, 'Relative error (--)'),
+        ]):
+            ax = axes[row, col]
+            ax.boxplot([data], labels=[title], patch_artist=True, showfliers=False,
+                       medianprops=dict(color='black'),
+                       boxprops=dict(facecolor=COLORS[col], alpha=0.6))
+            ax.set_yscale('log')
+            if col == 0:
+                ax.set_ylabel(ylabel)
+    fig.suptitle(r'JVP validation — $\dot{\omega}$ components', fontsize=10)
+    plt.tight_layout()
+    plt.savefig('article_figures/jvp_boxplots.png', bbox_inches='tight')
+    plt.close()
+
+    # Fig 2 — MAE par espèce
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+    x = np.arange(n_sp)
+    for ax, sp_mae, label, color in [
+        (axes[0], sp_mae_torch, 'Torch vs Cantera exact', COLORS[1]),
+        (axes[1], sp_mae_cuda,  'CUDA  vs Cantera exact', COLORS[2]),
+    ]:
+        ax.bar(x, sp_mae, color=color, alpha=0.7, width=1.0)
+        ax.set_yscale('log')
+        ax.set_xlabel('Species index')
+        ax.set_ylabel(r'MAE (mol m$^{-3}$ s$^{-1}$)')
+        ax.set_title(label, fontsize=8)
+        for k in np.argsort(sp_mae)[-3:][::-1]:
+            ax.text(k, sp_mae[k] * 1.5, sp_names[k],
+                    ha='center', fontsize=6, rotation=90)
+    plt.tight_layout()
+    plt.savefig('article_figures/jvp_per_species.png', bbox_inches='tight')
+    plt.close()
+
+    # Fig 3 — Scatter : impl vs Cantera exact (sous-échantillonné)
+    fig, axes = plt.subplots(1, 2, figsize=(7, 3))
+    rng = np.random.default_rng(0)
+    idx = rng.choice(N_JVP * n_sp, min(5000, N_JVP * n_sp), replace=False)
+    v_ref = ref_jvC.ravel()[idx]
+    for ax, jvC_impl, label, col in [
+        (axes[0], torch_jvC,  'Torch', COLORS[1]),
+        (axes[1], cuda_Jv_om, 'CUDA',  COLORS[2]),
+    ]:
+        v_im = jvC_impl.ravel()[idx]
+        ax.scatter(v_ref, v_im, s=1, alpha=0.3, color=col, rasterized=True)
+        lim = [min(v_ref.min(), v_im.min()), max(v_ref.max(), v_im.max())]
+        ax.axline((lim[0], lim[0]), slope=1, color='red',
+                  linewidth=0.4, linestyle=':', label='x=y')
+        ax.set_xlabel(r'Cantera exact (mol m$^{-3}$ s$^{-1}$)')
+        ax.set_ylabel(f'{label} (mol m$^{-3}$ s$^{-1}$)')
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig('article_figures/jvp_scatter.png', bbox_inches='tight')
+    plt.close()
+
+    print(f'\n  Figures: jvp_boxplots, jvp_per_species, jvp_scatter')
+    print(f'  CUDA JVP timing: {t_cuda_jvp*1e3:.2f} ms  '
+          f'({t_cuda_jvp/N_JVP*1e6:.2f} µs/reactor)')
 
 print('\n' + '='*70)
 print('All sections complete. Figures in article_figures/')
