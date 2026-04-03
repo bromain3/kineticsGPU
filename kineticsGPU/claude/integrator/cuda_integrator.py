@@ -20,7 +20,7 @@ from numba import int32
 import time
 
 from ..mechanism.mechanism_data import MechanismData
-from ..kernels.chemistry_kernels import (
+from ..kernels.per_thread.chemistry_kernels import (
     backward_euler_kernel,
     _fill_int_zero,
     _store_snapshot,
@@ -97,7 +97,7 @@ class CUDABackwardEulerIntegrator:
 
         def _buf(shape):  return cuda.device_array(shape, dtype=dt)
         def _ibuf(shape): return cuda.device_array(shape, dtype=np.int32)
-        def _d1():        return _buf((B, 1))  # dummy placeholder
+        def _d1():        return _buf((B, 1))
 
         # Ping-pong state
         self._d_TC_a = _buf((B, Nst))
@@ -117,7 +117,6 @@ class CUDABackwardEulerIntegrator:
 
         # Chemistry context buffers (global memory, per-reactor rows)
         def _ce(n):  return _buf((B, n)) if n > 0 else _d1()
-        def _cef(n): return _buf((B, n)) if n > 0 else _d1()
 
         self._ctx_kf_e   = _ce(n_e);    self._ctx_Kc_e   = _ce(n_e)
         self._ctx_cr_e   = _ce(n_e);    self._ctx_cp_e   = _ce(n_e)
@@ -130,16 +129,16 @@ class CUDABackwardEulerIntegrator:
         self._ctx_sRrtb  = _ce(n_tr_tb);self._ctx_sRptb  = _ce(n_tp_tb)
         self._ctx_bRR_tb = _ce(n_tb);   self._ctx_M_tb   = _ce(n_tb)
 
-        self._ctx_kf_f   = _cef(n_f);   self._ctx_Kc_f   = _cef(n_f)
-        self._ctx_cr_f   = _cef(n_f);   self._ctx_cp_f   = _cef(n_f)
-        self._ctx_dG0_f  = _cef(n_f)
-        self._ctx_sRrf   = _cef(n_tr_f);self._ctx_sRpf   = _cef(n_tp_f)
-        self._ctx_k0_f   = _cef(n_f);   self._ctx_kinf_f = _cef(n_f)
-        self._ctx_M_f    = _cef(n_f);   self._ctx_Pr_f   = _cef(n_f)
-        self._ctx_F_f    = _cef(n_f);   self._ctx_kb_f   = _cef(n_f)
-        self._ctx_Fc_f   = _cef(n_f);   self._ctx_lFc_f  = _cef(n_f)
-        self._ctx_Cp_f   = _cef(n_f);   self._ctx_Np_f   = _cef(n_f)
-        self._ctx_f1_f   = _cef(n_f);   self._ctx_exp_f  = _cef(n_f)
+        self._ctx_kf_f   = _ce(n_f);    self._ctx_Kc_f   = _ce(n_f)
+        self._ctx_cr_f   = _ce(n_f);    self._ctx_cp_f   = _ce(n_f)
+        self._ctx_dG0_f  = _ce(n_f)
+        self._ctx_sRrf   = _ce(n_tr_f); self._ctx_sRpf   = _ce(n_tp_f)
+        self._ctx_k0_f   = _ce(n_f);    self._ctx_kinf_f = _ce(n_f)
+        self._ctx_M_f    = _ce(n_f);    self._ctx_Pr_f   = _ce(n_f)
+        self._ctx_F_f    = _ce(n_f);    self._ctx_kb_f   = _ce(n_f)
+        self._ctx_Fc_f   = _ce(n_f);    self._ctx_lFc_f  = _ce(n_f)
+        self._ctx_Cp_f   = _ce(n_f);    self._ctx_Np_f   = _ce(n_f)
+        self._ctx_f1_f   = _ce(n_f);    self._ctx_exp_f  = _ce(n_f)
 
     # ─────────────────────────────────────────────────────────────────────
 

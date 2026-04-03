@@ -1,228 +1,140 @@
 """
-chemistry_kernels_eval.py — Kernels d'évaluation standalone pour validation.
+chemistry_kernels_article.py — Wrapper standalone pour validation (section RR_and_source_terms).
 
-Un kernel par réacteur (version per-thread), utilisé uniquement dans les tests
-pour calculer les taux de réaction et omega sur un batch de conditions (T, C).
+Utilise les device-functions per-block refactorisées au lieu de dupliquer la logique.
+Architecture : 1 bloc = 1 réacteur (même que l'intégrateur per-block).
 
-Ces kernels ne sont PAS utilisés dans l'intégrateur — ils servent uniquement
-à reproduire la section RR_and_source_terms du script de validation torch.
-
-Architecture: 1 thread = 1 réacteur (pas de parallélisme intra-bloc).
+API publique inchangée :
+    evaluator = CUDAReactionEvaluator(mech)
+    RR_e, RR_tb, RR_f, omega = evaluator.evaluate(T_np, C_np)
 """
 
 import math
 import numpy as np
 from numba import cuda, float64, int32
 
-R_CONST  = 8.314_462_618_153_24
-PREF     = 101325.0
-EPS      = 1e-300
-
-THREADS_EVAL = 128  # threads par bloc pour les kernels d'évaluation
-
-
-# =============================================================================
-#  Device helpers (copiés depuis chemistry_kernels_pb pour autonomie)
-# =============================================================================
-
-@cuda.jit(device=True, inline=True)
-def _load_coef7_ev(T, sp, Tmid, coef_low, coef_high, out7):
-    base = sp * 7
-    arr  = coef_low if T <= Tmid[sp] else coef_high
-    for k in range(7):
-        out7[k] = arr[base + k]
-
-@cuda.jit(device=True, inline=True)
-def _h_RT_ev(T, c7):
-    T2 = T*T; T3 = T2*T; T4 = T3*T
-    return (c7[0] + c7[1]*T/2.0 + c7[2]*T2/3.0
-            + c7[3]*T3/4.0 + c7[4]*T4/5.0 + c7[5]/T)
-
-@cuda.jit(device=True, inline=True)
-def _s_R_ev(T, c7):
-    T2 = T*T; T3 = T2*T; T4 = T3*T
-    return (c7[0]*math.log(T) + c7[1]*T + c7[2]*T2/2.0
-            + c7[3]*T3/3.0 + c7[4]*T4/4.0 + c7[6])
-
-@cuda.jit(device=True, inline=True)
-def _cp_R_ev(T, c7):
-    T2 = T*T; T3 = T2*T; T4 = T3*T
-    return c7[0] + c7[1]*T + c7[2]*T2 + c7[3]*T3 + c7[4]*T4
-
-@cuda.jit(device=True, inline=True)
-def _kf_arr_ev(T, A, n, Ea):
-    return A * (T**n) * math.exp(-Ea / (R_CONST * T))
-
-@cuda.jit(device=True, inline=True)
-def _lcp_ev(C, i0, i1, sp_idx, sto):
-    s = float64(0.0)
-    for k in range(i0, i1):
-        c = C[sp_idx[k]]
-        s += sto[k] * math.log(c if c > EPS else EPS)
-    return s
+from kineticsGPU.claude.kernels.per_block.chemistry_kernels_pb import (
+    MAX_N_STATE,
+    THREADS_PER_BLOCK,
+)
+from kineticsGPU.claude.kernels.per_block.context_pb import _eval_rhs_and_context_pb
 
 
-# =============================================================================
-#  Kernel : évaluation des taux de réaction ET de omega
-#
-#  Sorties :
-#    RR_e   (B, n_e)    — taux nets des réactions élémentaires  [mol/m³/s]
-#    RR_tb  (B, n_tb)   — taux nets des réactions trois-corps
-#    RR_f   (B, n_f)    — taux nets des réactions falloff
-#    omega  (B, n_sp)   — taux de production des espèces        [mol/m³/s]
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+#  Kernel principal — 1 bloc = 1 réacteur
+#  Appelle _eval_rhs_and_context_pb pour remplir sh_om (= omega),
+#  puis écrit les RR depuis les buffers contexte vers la mémoire globale.
+# ─────────────────────────────────────────────────────────────────────────────
 
-@cuda.jit
+@cuda.jit(cache=True)
 def eval_rr_and_omega_kernel(
-    T_arr, C_arr,           # (B,) et (B, n_sp)
-    RR_e, RR_tb, RR_f,      # sorties RR par type  (B, n_rxn)
-    omega,                  # sortie omega          (B, n_sp)
+    T_arr, C_arr,          # (B,) et (B, n_sp)
+    out_RR_e,              # (B, n_e)
+    out_RR_tb,             # (B, n_tb)
+    out_RR_f,              # (B, n_f)
+    out_omega,             # (B, n_sp)
+    # ── Buffers contexte cinétique (une ligne par réacteur) ───────────────
+    ctx_kf_e,   ctx_Kc_e,  ctx_cr_e,  ctx_cp_e,  ctx_dG0_e,
+    ctx_sRre,   ctx_sRpe,
+    ctx_kf_tb,  ctx_Kc_tb, ctx_cr_tb, ctx_cp_tb, ctx_dG0_tb,
+    ctx_sRrtb,  ctx_sRptb, ctx_bRR_tb, ctx_M_tb,
+    ctx_kf_f,   ctx_Kc_f,  ctx_cr_f,  ctx_cp_f,  ctx_dG0_f,
+    ctx_sRrf,   ctx_sRpf,
+    ctx_k0_f,   ctx_kinf_f, ctx_M_f,  ctx_Pr_f,  ctx_F_f,   ctx_kb_f,
+    ctx_Fc_f,   ctx_lFc_f, ctx_Cp_f,  ctx_Np_f,  ctx_f1_f,  ctx_exp_f,
+    # ── Données mécanisme ─────────────────────────────────────────────────
     n_sp,
     thL, thH, thM,
-    # Elementary
-    n_e, eA, en, eEa, eOW, eDn,
-    eRI, eRS, eRO, ePI, ePS, ePO,
-    # Three-body
-    n_tb, tbA, tbn, tbEa, tbOW, tbDn,
-    tbRI, tbRS, tbRO, tbPI, tbPS, tbPO, tbEff,
-    # Falloff
+    n_e, eA, en, eEa, eOW, eDn, eRI, eRS, eRO, ePI, ePS, ePO,
+    n_tb, tbA, tbn, tbEa, tbOW, tbDn, tbRI, tbRS, tbRO, tbPI, tbPS, tbPO, tbEff,
     n_f, fA0, fb0, fE0, fAi, fbi, fEi,
     fOW, fDn, fTA, fT1, fT2, fT3, fIT,
     fRI, fRS, fRO, fPI, fPS, fPO, fEff,
 ):
-    b = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    b         = cuda.blockIdx.x
+    tid       = cuda.threadIdx.x
+    n_threads = cuda.blockDim.x
+
     if b >= T_arr.shape[0]:
         return
 
-    T = T_arr[b]
-    c7 = cuda.local.array(7, float64)
+    # ── Shared memory ────────────────────────────────────────────────────────
+    sh_C  = cuda.shared.array(MAX_N_STATE, float64)
+    sh_om = cuda.shared.array(MAX_N_STATE, float64)
 
-    # ── Zéro omega ────────────────────────────────────────────────────
-    for s in range(n_sp):
-        omega[b, s] = float64(0.0)
+    T_loc = T_arr[b]
 
-    # ── Élémentaires ──────────────────────────────────────────────────
-    for j in range(n_e):
-        kf = _kf_arr_ev(T, eA[j], en[j], eEa[j])
-        dG = float64(0.0)
-        for k in range(eRO[j], eRO[j+1]):
-            sp = eRI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG -= eRS[k] * (h_s - T*s_s)
-        for k in range(ePO[j], ePO[j+1]):
-            sp = ePI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG += ePS[k] * (h_s - T*s_s)
-        Kp = math.exp(-dG / (R_CONST * T))
-        Kc = Kp * ((PREF / (R_CONST * T)) ** eDn[j])
-        lr = _lcp_ev(C_arr[b], eRO[j], eRO[j+1], eRI, eRS)
-        lp = _lcp_ev(C_arr[b], ePO[j], ePO[j+1], ePI, ePS)
-        cr = math.exp(lr); cp = math.exp(lp)
-        ow = eOW[j]
-        RR = kf * (cr - (1.0 - ow) * cp / Kc)
-        RR_e[b, j] = RR
-        for k in range(eRO[j], eRO[j+1]):
-            omega[b, eRI[k]] -= eRS[k] * RR
-        for k in range(ePO[j], ePO[j+1]):
-            omega[b, ePI[k]] += ePS[k] * RR
+    i = tid
+    while i < n_sp:
+        sh_C[i] = C_arr[b, i]
+        i += n_threads
+    cuda.syncthreads()
 
-    # ── Trois-corps ───────────────────────────────────────────────────
-    for j in range(n_tb):
-        kf = _kf_arr_ev(T, tbA[j], tbn[j], tbEa[j])
-        dG = float64(0.0)
-        for k in range(tbRO[j], tbRO[j+1]):
-            sp = tbRI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG -= tbRS[k] * (h_s - T*s_s)
-        for k in range(tbPO[j], tbPO[j+1]):
-            sp = tbPI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG += tbPS[k] * (h_s - T*s_s)
-        Kp = math.exp(-dG / (R_CONST * T))
-        Kc = Kp * ((PREF / (R_CONST * T)) ** tbDn[j])
-        lr = _lcp_ev(C_arr[b], tbRO[j], tbRO[j+1], tbRI, tbRS)
-        lp = _lcp_ev(C_arr[b], tbPO[j], tbPO[j+1], tbPI, tbPS)
-        cr = math.exp(lr); cp = math.exp(lp)
-        M = float64(0.0)
-        for s in range(n_sp):
-            M += C_arr[b, s] * tbEff[j * n_sp + s]
-        ow = tbOW[j]
-        RR = kf * (cr - (1.0 - ow) * cp / Kc) * M
-        RR_tb[b, j] = RR
-        for k in range(tbRO[j], tbRO[j+1]):
-            omega[b, tbRI[k]] -= tbRS[k] * RR
-        for k in range(tbPO[j], tbPO[j+1]):
-            omega[b, tbPI[k]] += tbPS[k] * RR
+    # ── Slices contexte pour ce réacteur ────────────────────────────────────
+    e_kf   = ctx_kf_e[b];   e_Kc  = ctx_Kc_e[b]
+    e_cr   = ctx_cr_e[b];   e_cp  = ctx_cp_e[b];  e_dG  = ctx_dG0_e[b]
+    e_sRr  = ctx_sRre[b];   e_sRp = ctx_sRpe[b]
 
-    # ── Falloff ───────────────────────────────────────────────────────
-    for j in range(n_f):
-        k0_v   = _kf_arr_ev(T, fA0[j], fb0[j], fE0[j])
-        kinf_v = _kf_arr_ev(T, fAi[j], fbi[j], fEi[j])
-        M = float64(0.0)
-        for s in range(n_sp):
-            M += C_arr[b, s] * fEff[j * n_sp + s]
-        ki_s = kinf_v if kinf_v > EPS else EPS
-        Pr   = (k0_v * M) / ki_s
-        if fIT[j]:
-            tA = fTA[j]; t1 = fT1[j]; t2 = fT2[j]; t3 = fT3[j]
-            Fc = float64(0.0)
-            if t1 > EPS: Fc += tA * math.exp(-T/t1)
-            if t3 > EPS: Fc += (1.0 - tA) * math.exp(-T/t3)
-            if t2 > EPS: Fc += math.exp(-t2/T)
-            if Fc < EPS: Fc = EPS
-            lFc   = math.log10(Fc)
-            Cp    = -0.4 - 0.67*lFc
-            Np    =  0.75 - 1.27*lFc
-            Prr   = Pr if Pr > EPS else EPS
-            logPr = math.log10(Prr)
-            num   = logPr + Cp
-            den   = Np - 0.14*(logPr + Cp)
-            if abs(den) < EPS: den = EPS if den >= 0.0 else -EPS
-            f1_v  = num / den
-            ex    = lFc / (1.0 + f1_v*f1_v)
-            F_v   = 10.0**ex
-        else:
-            F_v = float64(1.0)
-        kbase = ki_s * (Pr / (1.0 + Pr))
-        kf_v  = kbase * F_v
-        dG = float64(0.0)
-        for k in range(fRO[j], fRO[j+1]):
-            sp = fRI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG -= fRS[k] * (h_s - T*s_s)
-        for k in range(fPO[j], fPO[j+1]):
-            sp = fPI[k]
-            _load_coef7_ev(T, sp, thM, thL, thH, c7)
-            h_s = R_CONST * T * _h_RT_ev(T, c7)
-            s_s = R_CONST * _s_R_ev(T, c7)
-            dG += fPS[k] * (h_s - T*s_s)
-        Kp = math.exp(-dG / (R_CONST * T))
-        Kc = Kp * ((PREF / (R_CONST * T)) ** fDn[j])
-        lr = _lcp_ev(C_arr[b], fRO[j], fRO[j+1], fRI, fRS)
-        lp = _lcp_ev(C_arr[b], fPO[j], fPO[j+1], fPI, fPS)
-        cr = math.exp(lr); cp = math.exp(lp)
-        ow = fOW[j]
-        RR = kf_v * (cr - (1.0 - ow) * cp / Kc)
-        RR_f[b, j] = RR
-        for k in range(fRO[j], fRO[j+1]):
-            omega[b, fRI[k]] -= fRS[k] * RR
-        for k in range(fPO[j], fPO[j+1]):
-            omega[b, fPI[k]] += fPS[k] * RR
+    tb_kf  = ctx_kf_tb[b];  tb_Kc  = ctx_Kc_tb[b]
+    tb_cr  = ctx_cr_tb[b];  tb_cp  = ctx_cp_tb[b]; tb_dG = ctx_dG0_tb[b]
+    tb_sRr = ctx_sRrtb[b];  tb_sRp = ctx_sRptb[b]
+    tb_bRR = ctx_bRR_tb[b]; tb_M   = ctx_M_tb[b]
+
+    f_kf   = ctx_kf_f[b];   f_Kc   = ctx_Kc_f[b]
+    f_cr   = ctx_cr_f[b];   f_cp   = ctx_cp_f[b];  f_dG  = ctx_dG0_f[b]
+    f_sRr  = ctx_sRrf[b];   f_sRp  = ctx_sRpf[b]
+    f_k0   = ctx_k0_f[b];   f_ki   = ctx_kinf_f[b]
+    f_M    = ctx_M_f[b];    f_Pr   = ctx_Pr_f[b]
+    f_F    = ctx_F_f[b];    f_kb   = ctx_kb_f[b]
+    f_Fc   = ctx_Fc_f[b];   f_lFc  = ctx_lFc_f[b]
+    f_Cp   = ctx_Cp_f[b];   f_Np   = ctx_Np_f[b]
+    f_f1   = ctx_f1_f[b];   f_exp  = ctx_exp_f[b]
+
+    # ── Évaluation RHS + remplissage des caches cinétiques ──────────────────
+    _eval_rhs_and_context_pb(
+        tid, n_threads,
+        T_loc, sh_C,
+        e_kf, e_Kc, e_cr, e_cp, e_dG, e_sRr, e_sRp,
+        tb_kf, tb_Kc, tb_cr, tb_cp, tb_dG, tb_sRr, tb_sRp, tb_bRR, tb_M,
+        f_kf, f_Kc, f_cr, f_cp, f_dG, f_sRr, f_sRp,
+        f_k0, f_ki, f_M, f_Pr, f_F, f_kb,
+        f_Fc, f_lFc, f_Cp, f_Np, f_f1, f_exp,
+        sh_om, n_sp, thL, thH, thM,
+        n_e, eA, en, eEa, eOW, eDn, eRI, eRS, eRO, ePI, ePS, ePO,
+        n_tb, tbA, tbn, tbEa, tbOW, tbDn, tbRI, tbRS, tbRO, tbPI, tbPS, tbPO, tbEff,
+        n_f, fA0, fb0, fE0, fAi, fbi, fEi,
+        fOW, fDn, fTA, fT1, fT2, fT3, fIT, fRI, fRS, fRO, fPI, fPS, fPO, fEff,
+    )
+
+    # ── Écriture omega → mémoire globale ────────────────────────────────────
+    i = tid
+    while i < n_sp:
+        out_omega[b, i] = sh_om[i]
+        i += n_threads
+
+    # ── Écriture RR depuis les buffers contexte → mémoire globale ───────────
+    # Les ctx_*[b] contiennent déjà les taux nets calculés par _eval_rhs_and_context_pb.
+    i = tid
+    while i < n_e:
+        out_RR_e[b, i] = e_kf[i] * (e_cr[i] - (1.0 - eOW[i]) * e_cp[i] / e_Kc[i])
+        i += n_threads
+
+    i = tid
+    while i < n_tb:
+        out_RR_tb[b, i] = tb_bRR[i] * tb_M[i]
+        i += n_threads
+
+    i = tid
+    while i < n_f:
+        out_RR_f[b, i] = f_kf[i] * (f_cr[i] - (1.0 - fOW[i]) * f_cp[i] / f_Kc[i])
+        i += n_threads
+
+    cuda.syncthreads()
 
 
-# =============================================================================
-#  Wrapper Python
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+#  Wrapper Python — API identique à l'ancienne version
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CUDAReactionEvaluator:
     """
@@ -232,24 +144,75 @@ class CUDAReactionEvaluator:
     -----
     evaluator = CUDAReactionEvaluator(mech)
     RR_e, RR_tb, RR_f, omega = evaluator.evaluate(T_np, C_np)
-    # T_np : (B,)  float64
-    # C_np : (B, n_sp) float64  en mol/m³
+    # T_np  : (B,)       float64
+    # C_np  : (B, n_sp)  float64  en mol/m³
     # RR_*  : (B, n_rxn) float64  en mol/m³/s
-    # omega : (B, n_sp) float64  en mol/m³/s
+    # omega : (B, n_sp)  float64  en mol/m³/s
     """
 
     def __init__(self, mech, dtype=np.float64):
         self.mech  = mech
         self.dtype = dtype
         self._d    = mech.to_cuda_arrays()
-        self._args = self._pack_args()
+        self._mech_args = self._pack_mech_args()
 
-    def _pack_args(self):
-        d  = self._d
+    def _make_ctx(self, B):
+        """Alloue les buffers contexte cinétique pour B réacteurs."""
         m  = self.mech
+        dt = self.dtype
         e  = m.elementary
         tb = m.threebody
         fa = m.falloff
+
+        n_e  = e.n_reactions  if e  else 1
+        n_tb = tb.n_reactions if tb else 1
+        n_f  = fa.n_reactions if fa else 1
+
+        def _da(shape): return cuda.device_array(shape, dtype=dt)
+
+        return {
+            'kf_e':   _da((B, n_e)),
+            'Kc_e':   _da((B, n_e)),
+            'cr_e':   _da((B, n_e)),
+            'cp_e':   _da((B, n_e)),
+            'dG0_e':  _da((B, n_e)),
+            'sRre':   _da((B, e.react_offset[-1] if e else 1)),
+            'sRpe':   _da((B, e.prod_offset[-1]  if e else 1)),
+
+            'kf_tb':  _da((B, n_tb)),
+            'Kc_tb':  _da((B, n_tb)),
+            'cr_tb':  _da((B, n_tb)),
+            'cp_tb':  _da((B, n_tb)),
+            'dG0_tb': _da((B, n_tb)),
+            'sRrtb':  _da((B, tb.react_offset[-1] if tb else 1)),
+            'sRptb':  _da((B, tb.prod_offset[-1]  if tb else 1)),
+            'bRR_tb': _da((B, n_tb)),
+            'M_tb':   _da((B, n_tb)),
+
+            'kf_f':   _da((B, n_f)),
+            'Kc_f':   _da((B, n_f)),
+            'cr_f':   _da((B, n_f)),
+            'cp_f':   _da((B, n_f)),
+            'dG0_f':  _da((B, n_f)),
+            'sRrf':   _da((B, fa.react_offset[-1] if fa else 1)),
+            'sRpf':   _da((B, fa.prod_offset[-1]  if fa else 1)),
+            'k0_f':   _da((B, n_f)),
+            'kinf_f': _da((B, n_f)),
+            'M_f':    _da((B, n_f)),
+            'Pr_f':   _da((B, n_f)),
+            'F_f':    _da((B, n_f)),
+            'kb_f':   _da((B, n_f)),
+            'Fc_f':   _da((B, n_f)),
+            'lFc_f':  _da((B, n_f)),
+            'Cp_f':   _da((B, n_f)),
+            'Np_f':   _da((B, n_f)),
+            'f1_f':   _da((B, n_f)),
+            'exp_f':  _da((B, n_f)),
+        }
+
+    def _pack_mech_args(self):
+        d  = self._d
+        m  = self.mech
         dt = self.dtype
 
         def _g(k):  return d.get(k, cuda.device_array((1,), dt))
@@ -259,18 +222,18 @@ class CUDAReactionEvaluator:
             np.int32(m.n_species),
             d['thermo_coef_low'], d['thermo_coef_high'], d['thermo_Tmid'],
             # Elementary
-            np.int32(e.n_reactions if e else 0),
+            np.int32(m.elementary.n_reactions if m.elementary else 0),
             _g('e_A'), _g('e_n'), _g('e_Ea'), _g('e_oneWay'), _g('e_delta_n'),
             _gi('e_react_idx'), _g('e_react_sto'), _gi('e_react_offset'),
             _gi('e_prod_idx'),  _g('e_prod_sto'),  _gi('e_prod_offset'),
             # Three-body
-            np.int32(tb.n_reactions if tb else 0),
+            np.int32(m.threebody.n_reactions if m.threebody else 0),
             _g('tb_A'), _g('tb_n'), _g('tb_Ea'), _g('tb_oneWay'), _g('tb_delta_n'),
             _gi('tb_react_idx'), _g('tb_react_sto'), _gi('tb_react_offset'),
             _gi('tb_prod_idx'),  _g('tb_prod_sto'),  _gi('tb_prod_offset'),
             _g('tb_eff_matrix'),
             # Falloff
-            np.int32(fa.n_reactions if fa else 0),
+            np.int32(m.falloff.n_reactions if m.falloff else 0),
             _g('f_A_k0'),   _g('f_b_k0'),   _g('f_Ea_k0'),
             _g('f_A_kinf'), _g('f_b_kinf'), _g('f_Ea_kinf'),
             _g('f_oneWay'), _g('f_delta_n'),
@@ -285,8 +248,8 @@ class CUDAReactionEvaluator:
         """
         Parameters
         ----------
-        T_np : (B,) float64
-        C_np : (B, n_sp) float64 — concentrations en mol/m³
+        T_np : (B,)       float64
+        C_np : (B, n_sp)  float64 — concentrations en mol/m³
 
         Returns
         -------
@@ -295,30 +258,41 @@ class CUDAReactionEvaluator:
         RR_f   : (B, n_f)   float64
         omega  : (B, n_sp)  float64
         """
-        m   = self.mech
-        B   = T_np.shape[0]
-        dt  = self.dtype
-        e   = m.elementary
-        tb  = m.threebody
-        fa  = m.falloff
+        m  = self.mech
+        B  = int(T_np.shape[0])
+        dt = self.dtype
+        e  = m.elementary
+        tb = m.threebody
+        fa = m.falloff
 
         n_e  = e.n_reactions  if e  else 0
         n_tb = tb.n_reactions if tb else 0
         n_f  = fa.n_reactions if fa else 0
 
-        d_T     = cuda.to_device(np.ascontiguousarray(T_np,  dtype=dt))
-        d_C     = cuda.to_device(np.ascontiguousarray(C_np,  dtype=dt))
+        d_T     = cuda.to_device(np.ascontiguousarray(T_np, dtype=dt))
+        d_C     = cuda.to_device(np.ascontiguousarray(C_np, dtype=dt))
         d_RR_e  = cuda.device_array((B, max(n_e,  1)), dtype=dt)
         d_RR_tb = cuda.device_array((B, max(n_tb, 1)), dtype=dt)
         d_RR_f  = cuda.device_array((B, max(n_f,  1)), dtype=dt)
         d_omega = cuda.device_array((B, m.n_species),  dtype=dt)
 
-        n_blocks = math.ceil(B / THREADS_EVAL)
-        eval_rr_and_omega_kernel[n_blocks, THREADS_EVAL](
+        ctx = self._make_ctx(B)
+
+        eval_rr_and_omega_kernel[B, THREADS_PER_BLOCK](
             d_T, d_C,
-            d_RR_e, d_RR_tb, d_RR_f,
-            d_omega,
-            *self._args,
+            d_RR_e, d_RR_tb, d_RR_f, d_omega,
+            # Contexte
+            ctx['kf_e'],  ctx['Kc_e'],  ctx['cr_e'],  ctx['cp_e'],  ctx['dG0_e'],
+            ctx['sRre'],  ctx['sRpe'],
+            ctx['kf_tb'], ctx['Kc_tb'], ctx['cr_tb'], ctx['cp_tb'], ctx['dG0_tb'],
+            ctx['sRrtb'], ctx['sRptb'], ctx['bRR_tb'], ctx['M_tb'],
+            ctx['kf_f'],  ctx['Kc_f'],  ctx['cr_f'],  ctx['cp_f'],  ctx['dG0_f'],
+            ctx['sRrf'],  ctx['sRpf'],
+            ctx['k0_f'],  ctx['kinf_f'], ctx['M_f'],  ctx['Pr_f'],  ctx['F_f'],
+            ctx['kb_f'],  ctx['Fc_f'],  ctx['lFc_f'], ctx['Cp_f'],  ctx['Np_f'],
+            ctx['f1_f'],  ctx['exp_f'],
+            # Mécanisme
+            *self._mech_args,
         )
         cuda.synchronize()
 
@@ -328,6 +302,3 @@ class CUDAReactionEvaluator:
         omega = d_omega.copy_to_host()
 
         return RR_e, RR_tb, RR_f, omega
-
-
-import math  # already imported at top, kept for clarity

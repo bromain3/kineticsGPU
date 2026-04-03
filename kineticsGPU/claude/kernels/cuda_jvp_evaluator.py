@@ -23,14 +23,15 @@ from numba import cuda, float64, int32
 
 # Import des device-functions depuis le module per-block existant.
 # Elles sont déclarées @cuda.jit(device=True) donc réutilisables directement.
-from kineticsGPU.claude.kernels.chemistry_kernels_pb import (
-    _eval_rhs_and_context_pb,
-    _eval_jvp_pb,
-    _adiabatic_jvp_pb,
+# NOUVEAU
+from kineticsGPU.claude.kernels.per_block.chemistry_kernels_pb import (
     MAX_N_STATE,
     MAX_R,
     THREADS_PER_BLOCK,
 )
+from kineticsGPU.claude.kernels.per_block.context_pb import _eval_rhs_and_context_pb
+from kineticsGPU.claude.kernels.per_block.jvp_pb import _eval_jvp_pb
+from kineticsGPU.claude.kernels.per_block.reactor_odes_pb import _adiabatic_jvp_pb
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Kernel principal — 1 bloc = 1 réacteur

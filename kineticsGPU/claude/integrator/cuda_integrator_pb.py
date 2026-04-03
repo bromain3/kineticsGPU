@@ -19,7 +19,7 @@ import warnings
 from numba.core.errors import NumbaPerformanceWarning
 
 from ..mechanism.mechanism_data import MechanismData
-from ..kernels.chemistry_kernels_pb import (
+from ..kernels.per_block.chemistry_kernels_pb import (
     backward_euler_kernel_pb,
     MAX_R,
     THREADS_PER_BLOCK,
@@ -54,7 +54,7 @@ class CUDABackwardEulerIntegratorPB:
         gmres_maxiter: int  = 50,
         dtype               = np.float64,
     ):
-        assert gmres_restart <= 20, (
+        assert gmres_restart <= MAX_R, (
             f"gmres_restart doit être <= MAX_R={MAX_R} "
             f"(la mémoire partagée est statiquement dimensionnée à {MAX_R})"
         )
@@ -136,7 +136,7 @@ class CUDABackwardEulerIntegratorPB:
 
     # ─────────────────────────────────────────────────────────────────────
 
-    def step(self, d_TC: "cuda.devicearray.DeviceNDArray", h: float) -> "cuda.devicearray.DeviceNDArray":
+    def step(self, d_TC: "cuda.devicearray.DeviceNDArray", h: float):
         """
         Effectue un pas backward-Euler de taille h.
 
@@ -148,8 +148,8 @@ class CUDABackwardEulerIntegratorPB:
         Returns
         -------
         numba device array, shape (B, N_state), sur device
+        conv : numba device array (B,) int32 — drapeau de convergence
         """
-        # Réinitialiser le drapeau de convergence directement via CUDA
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NumbaPerformanceWarning)
             self._d_conv[:] = 0
@@ -183,7 +183,6 @@ class CUDABackwardEulerIntegratorPB:
             *self._mech_args,
         )
         cuda.synchronize()
-        #TODO: return the convergence flag
         return self._d_TC_out, self._d_conv
 
     # ─────────────────────────────────────────────────────────────────────

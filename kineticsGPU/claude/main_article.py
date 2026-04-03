@@ -15,19 +15,9 @@ import math
 import time
 import sys, os
 
-from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
-from kineticsGPU.reactionTypes import (
-    ReactionSystem, ElementaryReactionBatch,
-    ThreeBodyReactionBatch, FalloffReactionBatch,
-)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from kineticsGPU.claude.kernels.cuda_jvp_evaluator import CUDAJVPEvaluator
-from kineticsGPU.reactionTypes import (
-    ReactionSystem, ElementaryReactionBatch,
-    ThreeBodyReactionBatch, FalloffReactionBatch,
-)
 import kineticsGPU.thermo as yaml_thermo
 from kineticsGPU.reactionParser import parseReactions, build_reactions
 from kineticsGPU.claude.mechanism.mechanism_data import build_mechanism_data_from_torch
@@ -49,18 +39,20 @@ warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 # ─────────────────────────────────────────────────────────────────────────────
 # Flags
 # ─────────────────────────────────────────────────────────────────────────────
-RR_and_source_terms  = True
-Integrators          = True
-Architecture_compare = True
-Scalability          = True
-Error_analysis       = True
-JVP_validation       = True
+RR_and_source_terms  = False
+Integrators          = False
+Architecture_compare = False
+Scalability          = False
+Error_analysis       = False
+JVP_validation       = False
+Jacobian_validation  = True
 
 
-N_reactors_list      = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
+
+N_reactors_list      = [10, 100, 500]#[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
 N_STEPS_SCALABILITY  = 3000
 
-SIZE        = 10
+SIZE        = 1000
 T_END       = 3e-4
 H_DEFAULT   = 1e-7
 H_LIST      = [5e-6, 2e-6, 1e-6, 5e-7, 2e-7, 1e-7, 5e-8, 2e-8, 1e-8, 5e-9, 2e-9]
@@ -871,6 +863,341 @@ if JVP_validation:
     print(f'\n  Figures: jvp_boxplots, jvp_per_species, jvp_scatter')
     print(f'  CUDA JVP timing: {t_cuda_jvp*1e3:.2f} ms  '
           f'({t_cuda_jvp/N_JVP*1e6:.2f} µs/reactor)')
+
+if Jacobian_validation:
+    print('\n' + '=' * 70)
+    print('Section 7 — Jacobian validation (Cantera exact / CUDA PT / CUDA PB)')
+
+    from kineticsGPU.claude.kernels.per_thread.jacobian import CUDAJacobianEvaluatorPT
+    from kineticsGPU.claude.kernels.per_block.jacobian_pb import CUDAJacobianEvaluatorPB
+
+    N_JAC = 50  # nombre de réacteurs — jacobienne (54×54) par réacteur, coûteux côté Cantera
+
+    np.random.seed(17)
+    T_jac = np.random.uniform(800, 4000, N_JAC).astype(dtype_np)
+    C_jac = np.abs(np.random.randn(N_JAC, n_sp).astype(dtype_np)) * 5.0
+
+
+    # ── Helpers thermo scalaires (cohérents avec reactor_odes_pb.py) ──────────
+
+    def _dcvdT_analytic(gas_obj):
+        """
+        Retourne dcvdT_s pour toutes les espèces [J/mol/K²]
+        basé sur les polynômes NASA7 (analytique).
+        """
+        T = gas_obj.T
+        dcvdT = np.zeros(gas_obj.n_species)
+
+        for k in range(gas_obj.n_species):
+            sp = gas_obj.species(k)
+            thermo = sp.thermo
+
+            # coeffs NASA7
+            # format Cantera :
+            # [Tmid,
+            #  a1..a7 (high T),
+            #  a1..a7 (low T)]
+            coeffs = thermo.coeffs
+
+            Tmid = coeffs[0]
+
+            if T >= Tmid:
+                a = coeffs[1:8]  # high-T
+            else:
+                a = coeffs[8:15]  # low-T
+
+            # cp/R = a1 + a2*T + a3*T² + ...
+            # donc d(cp/R)/dT = a2 + 2a3*T + 3a4*T² + 4a5*T³
+            dcpdT_R = (
+                    a[1]
+                    + 2.0 * a[2] * T
+                    + 3.0 * a[3] * T ** 2
+                    + 4.0 * a[4] * T ** 3
+            )
+
+            dcvdT[k] = dcpdT_R * R_GAS  # J/mol/K²
+
+        return dcvdT
+
+    def _thermo_scalar(gas_obj):
+        """
+        Retourne (ntot, cv_mix, su_om, cv_s, u_s, dcvdT_s)
+        depuis un objet Cantera gas déjà initialisé (TP, concentrations fixés).
+        Unités : concentrations en mol/m³, énergies en J/mol.
+        """
+        C_mol = gas_obj.concentrations * 1e3  # kmol/m³ → mol/m³
+        T = gas_obj.T
+        ntot = C_mol.sum()
+        Xs = C_mol / ntot if ntot > 0 else np.zeros_like(C_mol)
+
+        # cv_s  [J/mol/K] = cp_s - R
+        cp_s = gas_obj.standard_cp_R * R_GAS  # cp_s = (cp/R) * R
+        cv_s = cp_s - R_GAS
+
+        # u_s   [J/mol]  = h_s - R*T
+        h_s = gas_obj.standard_enthalpies_RT * R_GAS * T
+        u_s = h_s - R_GAS * T
+
+        # dcvdT_s : dérivée par rapport à T de cv_s = cp_s - R
+        # On utilise la formule polynomiale NASA7 directement.
+        # Cantera ne l'expose pas directement → différences finies 2nd ordre
+        dcvdT = _dcvdT_analytic(gas_obj)
+
+        cv_mix = (Xs * cv_s).sum()
+        su_om = (u_s * gas_obj.net_production_rates * 1e3).sum()  # mol/m³/s
+
+        return ntot, cv_mix, su_om, cv_s, u_s, dcvdT
+
+
+    # ── 1. Référence Cantera complète ─────────────────────────────────────────
+
+    def _cantera_jacobian(T, C):
+        """
+        Jacobienne complète (n_state × n_state) du RHS adiabatique.
+
+        Bloc chimique [1:, :] :
+          J[s+1, 0]   = dω_s/dT       (mol/m³/s/K)    ddT[s] * 1e3
+          J[s+1, k+1] = dω_s/dC_k     (s⁻¹)           ddCi[s, k]
+
+        Ligne thermique [0, :] :
+          dT/dt = -su_om / denom,   denom = ntot * cv_mix
+
+          d(dT/dt)/dT   = -(dsuom_T * denom - su_om * ddenom_T) / denom²
+          d(dT/dt)/dC_s = -(dsuom_s * denom - su_om * ddenom_s) / denom²
+
+          dsuom_T   = sum_k( u_k * J[k+1, 0] ) + sum_k( cv_k * ω_k )
+          ddenom_T  = ntot * sum_k( X_k * dcvdT_k )
+
+          dsuom_s   = sum_k( u_k * J[k+1, s+1] )
+          ddenom_s  = cv_mix + ntot * (cv_s - cv_mix) / ntot
+                    = cv_s    (pour ntot > 0)
+        """
+        g = ct.Solution(yaml_file)
+        g.TP = float(T), 101325.0
+        g.concentrations = np.maximum(C, 0.0) * 1e-3  # mol/m³ → kmol/m³
+
+        n_state = n_sp + 1
+        J = np.zeros((n_state, n_state), dtype=dtype_np)
+
+        # ── Bloc chimique ─────────────────────────────────────────────
+        # ddCi  s⁻¹  (n_sp × n_sp)
+        ddCi = np.array(g.net_production_rates_ddCi)  # (n_sp, n_sp)
+        # ddT   kmol/m³/s/K → mol/m³/s/K
+        ddT = np.array(g.net_production_rates_ddT) * 1e3  # (n_sp,)
+
+        J[1:, 0] = ddT  # colonne T
+        J[1:, 1:] = ddCi  # colonnes C_s
+
+        # ── Ligne thermique ───────────────────────────────────────────
+        ntot, cv_mix, su_om, cv_s, u_s, dcvdT_s = _thermo_scalar(g)
+        om = g.net_production_rates * 1e3  # mol/m³/s
+        denom = ntot * cv_mix
+        if abs(denom) < 1e-300:
+            J[0, :] = 0.0
+            return J
+
+        C_mol = g.concentrations * 1e3
+        Xs = C_mol / ntot if ntot > 0 else np.zeros(n_sp)
+
+        # Colonne T
+        dsuom_T = (u_s * ddT).sum() + (cv_s * om).sum()
+        ddenom_T = ntot * (Xs * dcvdT_s).sum()
+        J[0, 0] = -(dsuom_T * denom - su_om * ddenom_T) / (denom ** 2)
+
+        # Colonnes C_s
+        for s in range(n_sp):
+            dsuom_s = (u_s * ddCi[:, s]).sum()
+            ddenom_s = cv_s[s]  # = cv_mix + ntot*(cv_s-cv_mix)/ntot = cv_s
+            J[0, s + 1] = -(dsuom_s * denom - su_om * ddenom_s) / (denom ** 2)
+
+        return J
+
+
+    print(f'  Computing Cantera exact Jacobian (N={N_JAC}) ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    ref_J = np.stack([_cantera_jacobian(T_jac[i], C_jac[i]) for i in range(N_JAC)])
+    print(f'{time.perf_counter() - t0:.1f}s')
+
+    # ── 2. CUDA per-thread ────────────────────────────────────────────────────
+    jac_pt = CUDAJacobianEvaluatorPT(mech, dtype=dtype_np)
+    jac_pt.evaluate(T_jac[:1], C_jac[:1])  # warmup JIT
+    print('  CUDA PT Jacobian evaluator JIT: done')
+
+    print('  Computing CUDA per-thread Jacobian ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    J_pt = jac_pt.evaluate(T_jac, C_jac)  # (N_JAC, n_state, n_state)
+    t_pt = time.perf_counter() - t0
+    print(f'{t_pt * 1e3:.2f}ms')
+
+    # ── 3. CUDA per-block ─────────────────────────────────────────────────────
+    jac_pb = CUDAJacobianEvaluatorPB(mech, dtype=dtype_np)
+    jac_pb.evaluate(T_jac[:1], C_jac[:1])  # warmup JIT
+    print('  CUDA PB Jacobian evaluator JIT: done')
+
+    print('  Computing CUDA per-block Jacobian ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    J_pb = jac_pb.evaluate(T_jac, C_jac)  # (N_JAC, n_state, n_state)
+    t_pb = time.perf_counter() - t0
+    print(f'{t_pb * 1e3:.2f}ms')
+
+
+    # ── Métriques ─────────────────────────────────────────────────────────────
+
+    def _jac_stats(label, J_impl, J_ref):
+        """Affiche MAE / rMAE sur les 3 blocs : total, chimique, thermique."""
+        diff = np.abs(J_impl - J_ref)
+        rel = diff / (np.abs(J_ref) + 1e-100)
+
+        # Bloc total
+        print(f'    {label} — total ({J_impl.shape[1]}×{J_impl.shape[2]})')
+        print(f'      MAE  = {diff.mean():.3e}  max = {diff.max():.3e}')
+        print(f'      rMAE = {rel.mean():.3e}   max = {rel.max():.3e}')
+
+        # Bloc chimique J[1:, :]  (n_sp × n_state)
+        dc = diff[:, 1:, :]
+        rc = rel[:, 1:, :]
+        print(f'    {label} — chimique [1:, :]')
+        print(f'      MAE  = {dc.mean():.3e}  max = {dc.max():.3e}')
+        print(f'      rMAE = {rc.mean():.3e}   max = {rc.max():.3e}')
+
+        # Ligne thermique J[0, :]  (n_state,)
+        dt = diff[:, 0, :]
+        rt = rel[:, 0, :]
+        print(f'    {label} — thermique [0, :]')
+        print(f'      MAE  = {dt.mean():.3e}  max = {dt.max():.3e}')
+        print(f'      rMAE = {rt.mean():.3e}   max = {rt.max():.3e}')
+
+        return diff, rel
+
+
+    print('\n  ── Métriques ──')
+    d_pt, r_pt = _jac_stats('CUDA PT vs Cantera', J_pt, ref_J)
+    d_pb, r_pb = _jac_stats('CUDA PB vs Cantera', J_pb, ref_J)
+    d_pp, r_pp = _jac_stats('CUDA PB vs CUDA PT', J_pb, J_pt)
+
+    # ── Erreur par colonne (par variable xk_j) ────────────────────────────────
+    col_mae_pt = np.abs(J_pt - ref_J).mean(axis=(0, 1))  # (n_state,)
+    col_mae_pb = np.abs(J_pb - ref_J).mean(axis=(0, 1))
+
+    print(f'\n  Worst 5 columns (PT vs Cantera):')
+    for k in np.argsort(col_mae_pt)[-5:][::-1]:
+        name = 'T' if k == 0 else gas.species_names[k - 1]
+        print(f'    xk[{k:2d}]={name:12s}  MAE={col_mae_pt[k]:.3e}')
+    print(f'  Worst 5 columns (PB vs Cantera):')
+    for k in np.argsort(col_mae_pb)[-5:][::-1]:
+        name = 'T' if k == 0 else gas.species_names[k - 1]
+        print(f'    xk[{k:2d}]={name:12s}  MAE={col_mae_pb[k]:.3e}')
+
+    # ── Figures ───────────────────────────────────────────────────────────────
+
+    # Fig 1 — Boxplots MAE absolue + relative  (total / chimique / thermique)
+    labels_box = ['PT total', 'PT chem', 'PT therm',
+                  'PB total', 'PB chem', 'PB therm']
+    data_abs = [
+        d_pt.ravel(),
+        d_pt[:, 1:, :].ravel(),
+        d_pt[:, 0, :].ravel(),
+        d_pb.ravel(),
+        d_pb[:, 1:, :].ravel(),
+        d_pb[:, 0, :].ravel(),
+    ]
+    data_rel = [
+        r_pt.ravel(),
+        r_pt[:, 1:, :].ravel(),
+        r_pt[:, 0, :].ravel(),
+        r_pb.ravel(),
+        r_pb[:, 1:, :].ravel(),
+        r_pb[:, 0, :].ravel(),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+    for ax, data, ylabel in [
+        (axes[0], data_abs, r'MAE (SI)'),
+        (axes[1], data_rel, 'Relative error (--)'),
+    ]:
+        ax.boxplot([d for d in data], labels=labels_box,
+                   patch_artist=True, showfliers=False,
+                   medianprops=dict(color='black'),
+                   boxprops=dict(facecolor=COLORS[2], alpha=0.6))
+        ax.set_yscale('log')
+        ax.set_ylabel(ylabel)
+        ax.tick_params(axis='x', labelrotation=30)
+    fig.suptitle('Jacobian validation vs Cantera exact', fontsize=10)
+    plt.tight_layout()
+    plt.savefig('article_figures/jacobian_boxplots.png', bbox_inches='tight')
+    plt.close()
+
+    # Fig 2 — Scatter : CUDA vs Cantera (sous-échantillon)
+    rng = np.random.default_rng(7)
+    tot = N_JAC * (n_sp + 1) ** 2
+    idx = rng.choice(tot, min(8000, tot), replace=False)
+    vref = ref_J.ravel()[idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(7, 3))
+    for ax, J_impl, label, col in [
+        (axes[0], J_pt, 'CUDA PT', COLORS[1]),
+        (axes[1], J_pb, 'CUDA PB', COLORS[2]),
+    ]:
+        vim = J_impl.ravel()[idx]
+        ax.scatter(vref, vim, s=1, alpha=0.3, color=col, rasterized=True)
+        lo = min(vref.min(), vim.min())
+        hi = max(vref.max(), vim.max())
+        ax.axline((lo, lo), slope=1, color='red', linewidth=0.4,
+                  linestyle=':', label='x=y')
+        ax.set_xlabel('Cantera exact (SI)')
+        ax.set_ylabel(f'{label} (SI)')
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig('article_figures/jacobian_scatter.png', bbox_inches='tight')
+    plt.close()
+
+    # Fig 3 — MAE par colonne xk_j
+    x = np.arange(n_sp + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+    for ax, col_mae, label, col in [
+        (axes[0], col_mae_pt, 'CUDA PT vs Cantera', COLORS[1]),
+        (axes[1], col_mae_pb, 'CUDA PB vs Cantera', COLORS[2]),
+    ]:
+        ax.bar(x, col_mae, color=col, alpha=0.7, width=1.0)
+        ax.set_yscale('log')
+        ax.set_xlabel('Column index $j$ in $x_k$  (0=T, j=C_{j-1})')
+        ax.set_ylabel('MAE (SI)')
+        ax.set_title(label, fontsize=8)
+        # Annotation des 3 pires colonnes
+        for k in np.argsort(col_mae)[-3:][::-1]:
+            name = 'T' if k == 0 else gas.species_names[k - 1]
+            ax.text(k, col_mae[k] * 1.5, name,
+                    ha='center', fontsize=6, rotation=90)
+    plt.tight_layout()
+    plt.savefig('article_figures/jacobian_per_column.png', bbox_inches='tight')
+    plt.close()
+
+    # Fig 4 — Heatmap moyenne des erreurs relatives (n_state × n_state)
+    mean_relerr_pt = r_pt.mean(axis=0)  # (n_state, n_state)
+    mean_relerr_pb = r_pb.mean(axis=0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for ax, mat, title in [
+        (axes[0], mean_relerr_pt, 'CUDA PT — mean rel. error'),
+        (axes[1], mean_relerr_pb, 'CUDA PB — mean rel. error'),
+    ]:
+        im = ax.imshow(np.log10(mat + 1e-20), aspect='auto',
+                       origin='upper', cmap='plasma')
+        plt.colorbar(im, ax=ax, label=r'$\log_{10}$ rel. error')
+        ax.set_xlabel('Column $j$  (0=T)')
+        ax.set_ylabel('Row $i$  (0=dT/dt)')
+        ax.set_title(title, fontsize=8)
+    plt.tight_layout()
+    plt.savefig('article_figures/jacobian_heatmap.png', bbox_inches='tight')
+    plt.close()
+
+    print(f'\n  Figures: jacobian_boxplots, jacobian_scatter, '
+          f'jacobian_per_column, jacobian_heatmap')
+    print(f'  Timing — CUDA PT: {t_pt * 1e3:.2f}ms  '
+          f'CUDA PB: {t_pb * 1e3:.2f}ms  '
+          f'({N_JAC} réacteurs)')
+
+
 
 print('\n' + '='*70)
 print('All sections complete. Figures in article_figures/')
