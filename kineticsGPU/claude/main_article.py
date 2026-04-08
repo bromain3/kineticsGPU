@@ -42,14 +42,14 @@ warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 RR_and_source_terms  = False
 Integrators          = False
 Architecture_compare = False
-Scalability          = False
-Error_analysis       = False
-JVP_validation       = False
+Scalability          = True
+Error_analysis       = True
+JVP_validation       = True
 Jacobian_validation  = True
 
 
 
-N_reactors_list      = [10, 100, 500]#[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
+N_reactors_list      = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
 N_STEPS_SCALABILITY  = 3000
 
 SIZE        = 1000
@@ -868,8 +868,8 @@ if Jacobian_validation:
     print('\n' + '=' * 70)
     print('Section 7 — Jacobian validation (Cantera exact / CUDA PT / CUDA PB)')
 
-    from kineticsGPU.claude.kernels.per_thread.jacobian import CUDAJacobianEvaluatorPT
-    from kineticsGPU.claude.kernels.per_block.jacobian_pb import CUDAJacobianEvaluatorPB
+    from kineticsGPU.claude.kernels.per_thread.jacobian import CUDAJacobianChemEvaluatorPT
+    from kineticsGPU.claude.kernels.per_block.jacobian_pb import CUDAJacobianChemEvaluatorPB
 
     N_JAC = 50  # nombre de réacteurs — jacobienne (54×54) par réacteur, coûteux côté Cantera
 
@@ -1019,7 +1019,7 @@ if Jacobian_validation:
     print(f'{time.perf_counter() - t0:.1f}s')
 
     # ── 2. CUDA per-thread ────────────────────────────────────────────────────
-    jac_pt = CUDAJacobianEvaluatorPT(mech, dtype=dtype_np)
+    jac_pt = CUDAJacobianChemEvaluatorPT(mech, dtype=dtype_np)
     jac_pt.evaluate(T_jac[:1], C_jac[:1])  # warmup JIT
     print('  CUDA PT Jacobian evaluator JIT: done')
 
@@ -1030,7 +1030,7 @@ if Jacobian_validation:
     print(f'{t_pt * 1e3:.2f}ms')
 
     # ── 3. CUDA per-block ─────────────────────────────────────────────────────
-    jac_pb = CUDAJacobianEvaluatorPB(mech, dtype=dtype_np)
+    jac_pb = CUDAJacobianChemEvaluatorPB(mech, dtype=dtype_np)
     jac_pb.evaluate(T_jac[:1], C_jac[:1])  # warmup JIT
     print('  CUDA PB Jacobian evaluator JIT: done')
 
