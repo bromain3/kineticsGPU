@@ -1,14 +1,13 @@
 import numpy as np
-import kineticsGPU.thermo as yaml_thermo
+import kineticsGPU.torch.thermo as yaml_thermo
 import torch
-import time
 
 torch.set_grad_enabled(False)
 
-from kineticsGPU.reactionParser import parseReactions, build_reactions
-from kineticsGPU.reactionTypesContext import ElementaryReactionBatchContext, ThreeBodyReactionBatchContext, FalloffReactionBatchContext, ReactionSystemContext
+from kineticsGPU.torch.reactionParser import parseReactions, build_reactions
+from kineticsGPU.torch.reactionTypesContext import ElementaryReactionBatchContext, ThreeBodyReactionBatchContext, FalloffReactionBatchContext, ReactionSystemContext
 from validationReactions import ElementaryReactionVal, ThreeBodyReactionVal, FalloffReactionVal
-from kineticsGPU.NumericalIntegrators.BDFTorchContext import BackwardEulerIntegrator
+from kineticsGPU.torch.NumericalIntegrators.BDFTorchContext import BackwardEulerIntegrator
 
 from yaml_parser import yamlParser
 import thermo_properties

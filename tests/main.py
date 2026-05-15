@@ -1,11 +1,11 @@
 import numpy as np
-import kineticsGPU.thermo as yaml_thermo
+import kineticsGPU.torch.thermo as yaml_thermo
 import torch
 
 torch.set_grad_enabled(False)
 
-from kineticsGPU.reactionParser import parseReactions, build_reactions
-from kineticsGPU.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch, ReactionSystem
+from kineticsGPU.torch.reactionParser import parseReactions, build_reactions
+from kineticsGPU.torch.reactionTypes import ElementaryReactionBatch, ThreeBodyReactionBatch, FalloffReactionBatch, ReactionSystem
 from validationReactions import ElementaryReactionVal, ThreeBodyReactionVal, FalloffReactionVal
 
 yaml_file = "../kineticsGPU/gri30.yaml"
@@ -284,7 +284,7 @@ def jvp_rhs_adiabatic(TC, t, dTC):
 
 
 # === INTÉGRATION ===
-from kineticsGPU.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
+from kineticsGPU.torch.NumericalIntegrators.BDFTorch import BackwardEulerIntegrator
 #from kineticsGPU.NumericalIntegrators.AdaptativeBDFTorch import BackwardEulerIntegrator
 
 dt = 1e-7
